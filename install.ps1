@@ -1,4 +1,4 @@
-# podcli installer for Windows — downloads the prebuilt native binary (no Go,
+# podcli installer for Windows - downloads the prebuilt native binary (no Go,
 # Node, Python, or ffmpeg needed; the binary provisions those on first run).
 # Usage: irm https://raw.githubusercontent.com/nmbrthirteen/podcli/main/install.ps1 | iex
 # Uninstall: & ([scriptblock]::Create((irm https://raw.githubusercontent.com/nmbrthirteen/podcli/main/install.ps1))) -Uninstall
@@ -43,7 +43,7 @@ if (-not $version) {
 
 $asset = "podcli-$target.exe"
 $base = "https://github.com/$repo/releases/download/v$version"
-Write-Host "Installing podcli v$version ($target)…"
+Write-Host "Installing podcli v$version ($target)..."
 
 $dest = Join-Path $binDir 'podcli.exe'
 Invoke-WebRequest "$base/$asset" -OutFile $dest -UseBasicParsing
@@ -58,7 +58,7 @@ try {
     if ($got -ne $want.ToLower()) { Remove-Item $dest -Force; throw "checksum mismatch (got $got want $want)" }
     Write-Host "  checksum verified"
   } else {
-    Write-Host "  no checksum entry for $asset — skipped verification"
+    Write-Host "  no checksum entry for $asset - skipped verification"
   }
 } catch {
   Write-Host "  checksum verification skipped: $($_.Exception.Message)"
@@ -70,4 +70,4 @@ if ($userPath -notlike "*$binDir*") {
   Write-Host "  added to PATH (restart your terminal)"
 }
 Write-Host ""
-Write-Host "Done — run:  podcli"
+Write-Host "Done - run:  podcli"

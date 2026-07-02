@@ -373,9 +373,8 @@ func uninstall(args []string) int {
 		if err := os.RemoveAll(p); err != nil {
 			if pathContains(p, self) {
 				runningInUse = true
-			} else {
-				fmt.Fprintf(os.Stderr, "  warning: could not remove %s: %v\n", p, err)
 			}
+			fmt.Fprintf(os.Stderr, "  warning: could not remove %s: %v\n", p, err)
 		}
 	}
 	if runningInUse {
@@ -403,7 +402,7 @@ func podcliLinks(managed, self string) []string {
 			continue
 		}
 		p := filepath.Join(d, "podcli"+paths.ExeSuffix())
-		if linkPointsTo(p, managed) || linkPointsTo(p, self) {
+		if linkPointsTo(p, managed) || (pathContains(paths.BinDir(), self) && linkPointsTo(p, self)) {
 			out = append(out, p)
 		}
 	}
