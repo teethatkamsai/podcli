@@ -64,10 +64,25 @@ export class TranscriptCache {
     });
   }
 
-  async get(filePath: string): Promise<TranscriptResult | null> {
+  async getFileHashForEngine(filePath: string, engine?: string): Promise<string> {
+    return `${await this.getFileHash(filePath)}${this.engineSuffix(engine)}`;
+  }
+
+  private engineSuffix(engine?: string): string {
+    const value = (engine ?? "").trim().toLowerCase();
+    if (["whispercpp", "whisper-cpp", "whisper.cpp", "cpp"].includes(value)) {
+      return "-whispercpp";
+    }
+    if (["assemblyai", "assembly-ai", "aai"].includes(value)) {
+      return "-assemblyai";
+    }
+    return "";
+  }
+
+  async get(filePath: string, engine?: string): Promise<TranscriptResult | null> {
     try {
       const hash = await this.getFileHash(filePath);
-      const cachePath = join(this.cacheDir, `${hash}.json`);
+      const cachePath = join(this.cacheDir, `${hash}${this.engineSuffix(engine)}.json`);
 
       if (!existsSync(cachePath)) return null;
 
@@ -78,10 +93,10 @@ export class TranscriptCache {
     }
   }
 
-  async set(filePath: string, transcript: TranscriptResult): Promise<void> {
+  async set(filePath: string, transcript: TranscriptResult, engine?: string): Promise<void> {
     await this.ensureDir();
     const hash = await this.getFileHash(filePath);
-    const cachePath = join(this.cacheDir, `${hash}.json`);
+    const cachePath = join(this.cacheDir, `${hash}${this.engineSuffix(engine)}.json`);
     await writeFile(cachePath, JSON.stringify(transcript), "utf-8");
   }
 
@@ -90,9 +105,9 @@ export class TranscriptCache {
    * written by backend/services/transcript_packer.py as a side-effect of
    * transcription. Returns null if not yet generated.
    */
-  async getPackedMarkdown(filePath: string): Promise<string | null> {
+  async getPackedMarkdown(filePath: string, engine?: string): Promise<string | null> {
     try {
-      const hash = await this.getFileHash(filePath);
+      const hash = await this.getFileHashForEngine(filePath, engine);
       return await this.readPackedByHash(hash);
     } catch {
       return null;

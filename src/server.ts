@@ -31,7 +31,8 @@ import { TranscriptCache } from "./services/transcript-cache.js";
 import { paths } from "./config/paths.js";
 import { childLogger } from "./utils/logger.js";
 import { mcpError } from "./utils/errors.js";
-import type { BatchClipsResult, UIState, WordTimestamp } from "./models/index.js";
+import { podcliVersion } from "./version.js";
+import type { BatchClipsResult, Format, UIState, WordTimestamp } from "./models/index.js";
 
 const log = childLogger("server");
 
@@ -224,7 +225,7 @@ async function getWorkflowGuidance(): Promise<string> {
 export function createServer(): McpServer {
   const server = new McpServer({
     name: "podcli",
-    version: "1.0.0",
+    version: podcliVersion(),
   });
 
   // =============================================
@@ -240,6 +241,10 @@ export function createServer(): McpServer {
         .optional()
         .default("base")
         .describe("Whisper model size"),
+      engine: z
+        .enum(["whisper-py", "whispercpp", "assemblyai"])
+        .optional()
+        .describe("Transcription engine"),
       language: z.string().optional().describe("ISO language code"),
       enable_diarization: z
         .boolean()
@@ -256,6 +261,7 @@ export function createServer(): McpServer {
     async ({
       file_path,
       model_size,
+      engine,
       language,
       enable_diarization,
       num_speakers,
@@ -264,6 +270,7 @@ export function createServer(): McpServer {
         const result = await handleTranscribe({
           file_path,
           model_size,
+          engine,
           language,
           enable_diarization,
           num_speakers,
@@ -273,7 +280,7 @@ export function createServer(): McpServer {
         // on-disk cache — NOT the trimmed MCP response. Without words in UI
         // state, downstream batch_create_clips can't burn captions.
         try {
-          const cached = await transcriptCache.get(file_path);
+          const cached = await transcriptCache.get(file_path, engine);
           if (cached) {
             await uiPing({
               videoPath: file_path,
@@ -313,6 +320,7 @@ export function createServer(): McpServer {
         .optional()
         .default("base"),
       language: z.string().optional(),
+      engine: z.enum(["whisper-py", "whispercpp", "assemblyai"]).optional(),
       enable_diarization: z.boolean().optional().default(true),
       num_speakers: z.number().optional(),
     },
@@ -461,6 +469,11 @@ export function createServer(): McpServer {
         .optional()
         .default("speaker")
         .describe("Cropping strategy"),
+      format: z
+        .enum(["vertical", "horizontal", "square"])
+        .optional()
+        .default("vertical")
+        .describe("Output aspect ratio (vertical=9:16, horizontal=16:9, square=1:1)"),
       allow_ass_fallback: z
         .boolean()
         .optional()
@@ -565,6 +578,7 @@ export function createServer(): McpServer {
           params.end_second as number,
           (params.caption_style || "hormozi") as string,
           (params.crop_strategy || "speaker") as string,
+          (params.format || "vertical") as string,
         );
         if (dup) {
           return {
@@ -593,6 +607,7 @@ export function createServer(): McpServer {
                   title: (params.title || "clip") as string,
                   caption_style: params.caption_style || "hormozi",
                   crop_strategy: params.crop_strategy || "speaker",
+                  format: params.format || "vertical",
                   allow_ass_fallback: params.allow_ass_fallback === true,
                   keep_caption_overlay: params.keep_caption_overlay === true,
                   ...(keepSegments && { segments: keepSegments }),
@@ -655,6 +670,7 @@ export function createServer(): McpServer {
             end_second: params.end_second as number,
             caption_style: (params.caption_style || "hormozi") as string,
             crop_strategy: (params.crop_strategy || "speaker") as string,
+            format: (params.format || "vertical") as Format,
             logo_path: params.logo_path as string | undefined,
             title: (params.title || "clip") as string,
             output_path: parsed.output_path,
@@ -705,6 +721,7 @@ export function createServer(): McpServer {
               .enum(["hormozi", "karaoke", "subtle", "branded"])
               .optional(),
             crop_strategy: z.enum(["center", "face", "speaker"]).optional(),
+            format: z.enum(["vertical", "horizontal", "square"]).optional(),
             allow_ass_fallback: z.boolean().optional(),
             keep_caption_overlay: z.boolean().optional(),
           }),
@@ -783,6 +800,7 @@ export function createServer(): McpServer {
                   settings.captionStyle ||
                   "hormozi",
                 crop_strategy: settings.cropStrategy || "speaker",
+                format: settings.format || "vertical",
                 allow_ass_fallback: false,
                 ...(s.segments &&
                   s.segments.length > 0 && { keep_segments: s.segments }),
@@ -801,6 +819,7 @@ export function createServer(): McpServer {
                     settings.captionStyle ||
                     "hormozi",
                   crop_strategy: settings.cropStrategy || "speaker",
+                  format: settings.format || "vertical",
                   allow_ass_fallback: false,
                   ...(s.segments &&
                     s.segments.length > 0 && { keep_segments: s.segments }),
@@ -1124,6 +1143,10 @@ export function createServer(): McpServer {
         .string()
         .optional()
         .describe("Crop strategy (for check)"),
+      format: z
+        .enum(["vertical", "horizontal", "square"])
+        .optional()
+        .describe("Output format (for check)"),
       limit: z.number().optional().default(20).describe("Max results for list"),
     },
     async ({
@@ -1134,6 +1157,7 @@ export function createServer(): McpServer {
       end_second,
       caption_style,
       crop_strategy,
+      format,
       limit,
     }) => {
       try {
@@ -1184,6 +1208,7 @@ export function createServer(): McpServer {
             end_second,
             caption_style || "hormozi",
             crop_strategy || "speaker",
+            format || "vertical",
           );
           if (dup) {
             return {
@@ -1289,7 +1314,10 @@ export function createServer(): McpServer {
           // Auto-generated during transcription — see backend/services/transcript_packer.py.
           let packed: string | null = null;
           if (state.videoPath) {
-            packed = await transcriptCache.getPackedMarkdown(state.videoPath);
+            packed = await transcriptCache.getPackedMarkdown(
+              state.videoPath,
+              state.transcript?.engine,
+            );
           }
           if (!packed && state.rawTranscriptText) {
             packed = await transcriptCache.getPackedMarkdownFromText(
@@ -2045,6 +2073,96 @@ export function createServer(): McpServer {
   );
 
   // =============================================
+  // Tool: manage_reel
+  // =============================================
+  server.tool(
+    "manage_reel",
+    "Create and iterate on a highlights reel. Detection runs once with action 'new'; after that, edit individual moments fast (longer/shorter/earlier/later/shift/drop/toggle) and rebuild without re-detecting. Actions: 'new' (video_path, profile, format, top_n, min_dur, max_dur), 'list', 'show' (session_id), 'edit' (session_id, index, op, seconds), 'build' (session_id), 'delete' (session_id).",
+    {
+      action: z
+        .enum(["new", "list", "show", "edit", "build", "delete"])
+        .describe("What to do with the reel"),
+      video_path: z
+        .string()
+        .optional()
+        .describe("For 'new': path to the source video"),
+      session_id: z
+        .string()
+        .optional()
+        .describe("For show/edit/build/delete: the reel session id returned by 'new'"),
+      profile: z
+        .enum(["auto", "party", "action"])
+        .optional()
+        .describe("For 'new': detection profile (default auto)"),
+      format: z
+        .enum(["vertical", "horizontal", "square"])
+        .optional()
+        .describe("For 'new': reel aspect ratio (default horizontal)"),
+      top_n: z.number().optional().describe("For 'new': number of moments"),
+      min_dur: z.number().optional().describe("For 'new': shortest moment in seconds (default 15)"),
+      max_dur: z.number().optional().describe("For 'new': longest moment in seconds (default 60)"),
+      index: z
+        .number()
+        .optional()
+        .describe("For 'edit': 1-based moment number to adjust"),
+      op: z
+        .enum(["longer", "shorter", "earlier", "later", "shift", "set", "drop", "toggle"])
+        .optional()
+        .describe("For 'edit': how to change the moment"),
+      seconds: z
+        .number()
+        .optional()
+        .describe("For 'edit': seconds for longer/shorter/earlier/later/shift"),
+      start: z
+        .number()
+        .optional()
+        .describe("For 'edit' with op 'set': absolute start time in seconds"),
+      end: z
+        .number()
+        .optional()
+        .describe("For 'edit' with op 'set': absolute end time in seconds"),
+    },
+    async (params) => {
+      try {
+        const res = await fetch("http://localhost:3847/api/reel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(params),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as ApiError & Record<string, unknown>;
+        if (data.error) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${data.error}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(data, null, 2) },
+          ],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "Web UI is not running. Start with: npm run ui",
+              },
+            ],
+          };
+        }
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
   // Tool: set_video
   // =============================================
   server.tool(
@@ -2347,6 +2465,7 @@ export function createServer(): McpServer {
               "## Optional: DaVinci Resolve",
               "manage_integrations(action=enable, name=davinci_resolve) then export_to_davinci_resolve with source + caption overlay paths.",
               "Use manage_config(action=migrate) once after upgrading if transcription cache seems empty.",
+              "If clip suggestion fails with 'No AI CLI available', call ai_cli_status then manage_env(action=set, key=PODCLI_CLAUDE_PATH, value=/path/to/claude).",
               "",
               "## Available caption styles:",
               "- branded: Professional look with dark highlight box, gradient, optional logo",

@@ -25,6 +25,8 @@ try:
 except ImportError:
     pass
 import traceback
+from version import VERSION
+
 
 def emit_progress(task_id: str, stage: str, percent: int, message: str, **extra):
     """Write a progress event to stderr (picked up by TypeScript executor)."""
@@ -53,25 +55,43 @@ def emit_result(task_id: str, status: str, data=None, error=None):
 
 def handle_ping(task_id: str, params: dict):
     """Simple health check."""
-    emit_result(task_id, "success", data={"message": "pong", "version": "1.0.0"})
+    emit_result(task_id, "success", data={"message": "pong", "version": VERSION})
 
 
 def handle_transcribe(task_id: str, params: dict):
     """Transcribe a podcast video/audio file with speaker detection."""
     from services.transcription import transcribe_file
     from services.corrections import apply_corrections
-    from services.transcript_packer import compute_cache_hash, write_packed
+    from services.transcript_packer import compute_cache_hash, engine_cache_suffix, write_packed
 
     emit_progress(task_id, "transcribing", 0, "Starting transcription...")
     file_path = params["file_path"]
-    result = transcribe_file(
-        file_path=file_path,
-        model_size=params.get("model_size", "base"),
-        language=params.get("language"),
-        enable_diarization=params.get("enable_diarization", True),
-        num_speakers=params.get("num_speakers"),
-        progress_callback=lambda pct, msg: emit_progress(task_id, "transcribing", pct, msg),
-    )
+    engine = params.get("engine")
+    previous_engine = os.environ.get("PODCLI_ENGINE")
+    previous_assemblyai_key = os.environ.get("ASSEMBLYAI_API_KEY")
+    if engine:
+        os.environ["PODCLI_ENGINE"] = engine
+    if params.get("assemblyai_api_key"):
+        os.environ["ASSEMBLYAI_API_KEY"] = params["assemblyai_api_key"]
+    try:
+        result = transcribe_file(
+            file_path=file_path,
+            model_size=params.get("model_size", "base"),
+            engine=engine,
+            language=params.get("language"),
+            enable_diarization=params.get("enable_diarization", True),
+            num_speakers=params.get("num_speakers"),
+            progress_callback=lambda pct, msg: emit_progress(task_id, "transcribing", pct, msg),
+        )
+    finally:
+        if previous_engine is None:
+            os.environ.pop("PODCLI_ENGINE", None)
+        else:
+            os.environ["PODCLI_ENGINE"] = previous_engine
+        if previous_assemblyai_key is None:
+            os.environ.pop("ASSEMBLYAI_API_KEY", None)
+        else:
+            os.environ["ASSEMBLYAI_API_KEY"] = previous_assemblyai_key
     # Apply word corrections (Whisper misheard proper nouns)
     apply_corrections(result.get("words", []), result.get("segments", []))
 
@@ -80,18 +100,26 @@ def handle_transcribe(task_id: str, params: dict):
     try:
         from services.audio_analyzer import extract_audio_energy
 
-        cache_hash = compute_cache_hash(file_path)
+        cache_hash = compute_cache_hash(file_path) + engine_cache_suffix(result.get("engine") or engine)
         energy_data = None
         try:
             energy_data = extract_audio_energy(file_path)
         except Exception:
             pass  # energy is a nice-to-have
 
+        events_data = None
+        try:
+            from services.audio_events import extract_audio_events
+            events_data = extract_audio_events(file_path)
+        except Exception:
+            pass  # reactions are a nice-to-have
+
         packed_path, packed_md = write_packed(
             result,
             cache_hash,
             source_label=os.path.basename(file_path),
             energy_data=energy_data,
+            events_data=events_data,
         )
         result["packed_path"] = packed_path
         result["packed_size_bytes"] = len(packed_md.encode("utf-8"))
@@ -113,6 +141,7 @@ def handle_create_clip(task_id: str, params: dict):
         end_second=params["end_second"],
         caption_style=params.get("caption_style", "hormozi"),
         crop_strategy=params.get("crop_strategy", "face"),
+        format=params.get("format", "vertical"),
         crop_keyframes=params.get("crop_keyframes"),
         transcript_words=params.get("transcript_words", []),
         title=params.get("title", "clip"),
@@ -152,6 +181,7 @@ def handle_batch_clips(task_id: str, params: dict):
                 end_second=clip["end_second"],
                 caption_style=clip.get("caption_style", "hormozi"),
                 crop_strategy=clip.get("crop_strategy", "face"),
+                format=clip.get("format", params.get("format", "vertical")),
                 transcript_words=params.get("transcript_words", []),
                 title=clip.get("title", f"clip_{i + 1}"),
                 output_dir=params.get("output_dir"),
@@ -251,18 +281,27 @@ def handle_pack_transcript(task_id: str, params: dict):
         return
 
     energy_data = params.get("energy_data")
-    if energy_data is None and params.get("file_path"):
-        try:
-            from services.audio_analyzer import extract_audio_energy
-            energy_data = extract_audio_energy(params["file_path"])
-        except Exception:
-            pass
+    events_data = params.get("events_data")
+    if params.get("file_path"):
+        if energy_data is None:
+            try:
+                from services.audio_analyzer import extract_audio_energy
+                energy_data = extract_audio_energy(params["file_path"])
+            except Exception:
+                pass
+        if events_data is None:
+            try:
+                from services.audio_events import extract_audio_events
+                events_data = extract_audio_events(params["file_path"])
+            except Exception:
+                pass
 
     path, md = write_packed(
         transcript,
         cache_hash,
         source_label=params.get("source_label"),
         energy_data=energy_data,
+        events_data=events_data,
     )
     emit_result(task_id, "success", data={
         "packed_path": path,
@@ -287,6 +326,111 @@ def handle_analyze_energy(task_id: str, params: dict):
         progress_callback=lambda pct, msg: emit_progress(task_id, "analyzing", pct, msg),
     )
     emit_result(task_id, "success", data=result)
+
+
+def handle_detect_highlights(task_id: str, params: dict):
+    """Detect highlight clips from a video's fused signal curve (party/action profiles).
+
+    Accepts a single `video_path`, or a list of `video_paths` to pool and rank
+    highlights across a whole folder of clips.
+    """
+    from services.saliency import detect_highlights, detect_highlights_pooled
+
+    video_paths = params.get("video_paths")
+    video_path = params.get("video_path", "")
+    if not video_paths and not video_path:
+        emit_result(task_id, "error", error="video_path or video_paths is required")
+        return
+
+    common = dict(
+        profile_name=params.get("profile", "party"),
+        min_dur=float(params.get("min_dur", 8.0)),
+        max_dur=float(params.get("max_dur", 60.0)),
+        progress_callback=lambda pct, msg: emit_progress(task_id, "detecting", pct, msg),
+    )
+    if video_paths:
+        clips = detect_highlights_pooled(
+            video_paths=video_paths, top_n=int(params.get("top_n", 15)), **common
+        )
+    else:
+        clips = detect_highlights(
+            video_path=video_path, top_n=int(params.get("top_n", 8)), **common
+        )
+    emit_result(task_id, "success", data={"clips": clips, "count": len(clips)})
+
+
+def handle_manage_reel(task_id: str, params: dict):
+    """Create and iterate on a highlights reel — the MCP surface over the reel service.
+
+    Actions: new (detect + build), list, show, edit (adjust one moment + rebuild),
+    build, delete.
+    """
+    from dataclasses import asdict
+    from services.reel import (
+        ReelSession, seed_session, edit_moment, build_reel, list_sessions, delete_session,
+    )
+
+    action = params.get("action", "show")
+
+    def payload(session, reel=None):
+        moments = []
+        for i, m in enumerate(session.moments, 1):
+            d = asdict(m)
+            d["clip_path"] = os.path.join(session.out_dir, "clips", f"clip_{i:02d}.mp4")
+            d["clip_exists"] = os.path.exists(d["clip_path"])
+            moments.append(d)
+        reel_file = reel or os.path.join(session.out_dir, "highlights_reel.mp4")
+        return {
+            "session_id": session.session_id,
+            "source": session.source,
+            "format": session.format,
+            "out_dir": session.out_dir,
+            "reel_path": reel_file if os.path.exists(reel_file) else None,
+            "moments": moments,
+        }
+
+    try:
+        if action == "new":
+            from services.transcript_packer import compute_cache_hash, load_cached_transcript_for_video
+            video = params["video_path"]
+            sid = compute_cache_hash(video)
+            out_dir = params.get("out_dir") or os.path.join(os.getcwd(), f"reel_{sid[:8]}")
+            cached = load_cached_transcript_for_video(video)
+            words = cached.get("words") if cached else None
+            session = seed_session(
+                sid, video, out_dir, profile=params.get("profile", "auto"),
+                format=params.get("format", "horizontal"),
+                top_n=int(params.get("top_n", 10)),
+                min_dur=float(params.get("min_dur", 15.0)),
+                max_dur=float(params.get("max_dur", 60.0)),
+                words=words,
+                progress_callback=lambda p, m: emit_progress(task_id, "detecting", p, m),
+            )
+            reel = build_reel(session, progress_callback=lambda p, m: emit_progress(task_id, "building", p, m))
+            emit_result(task_id, "success", data=payload(session, reel))
+        elif action == "list":
+            emit_result(task_id, "success", data={"sessions": list_sessions()})
+        elif action == "delete":
+            ok = delete_session(params["session_id"])
+            emit_result(task_id, "success", data={"deleted": ok, "session_id": params["session_id"]})
+        elif action == "show":
+            emit_result(task_id, "success", data=payload(ReelSession.load(params["session_id"])))
+        elif action == "edit":
+            session = edit_moment(
+                ReelSession.load(params["session_id"]),
+                int(params["index"]), params["op"], float(params.get("seconds", 0.0)),
+                start=params.get("start"), end=params.get("end"),
+            )
+            reel = build_reel(session, progress_callback=lambda p, m: emit_progress(task_id, "building", p, m))
+            emit_result(task_id, "success", data=payload(session, reel))
+        elif action == "build":
+            session = ReelSession.load(params["session_id"])
+            reel = build_reel(session, progress_callback=lambda p, m: emit_progress(task_id, "building", p, m))
+            emit_result(task_id, "success", data=payload(session, reel))
+        else:
+            emit_result(task_id, "error", error=f"unknown reel action {action!r}")
+    except (KeyError, IndexError, ValueError, FileNotFoundError) as e:
+        emit_result(task_id, "error", error=str(e))
 
 
 def handle_detect_encoder(task_id: str, params: dict):
@@ -355,13 +499,24 @@ def handle_corrections(task_id: str, params: dict):
 
 def handle_suggest_clips(task_id: str, params: dict):
     """AI-powered clip suggestion using Claude/Codex and PodStack knowledge base."""
-    from services.claude_suggest import suggest_with_claude
+    from services.claude_suggest import suggest_with_claude, _find_ai_cli_candidates
 
     segments = params.get("segments", [])
     top_n = params.get("top_n", 5)
 
     if not segments:
         emit_result(task_id, "error", error="segments is required")
+        return
+
+    if not _find_ai_cli_candidates():
+        emit_result(
+            task_id,
+            "error",
+            error=(
+                "No AI CLI available (install Claude Code or Codex). "
+                "If already installed, set the path in Config → AI CLI or PODCLI_CLAUDE_PATH."
+            ),
+        )
         return
 
     clips = suggest_with_claude(
@@ -371,7 +526,11 @@ def handle_suggest_clips(task_id: str, params: dict):
     )
 
     if clips is None:
-        emit_result(task_id, "error", error="No AI CLI available (install Claude Code or Codex)")
+        emit_result(
+            task_id,
+            "error",
+            error="AI CLI found but suggestion failed — check claude/codex login and try again",
+        )
         return
 
     emit_result(task_id, "success", data={"clips": clips})
@@ -387,6 +546,12 @@ def handle_manage_env(task_id: str, params: dict):
         emit_result(task_id, "error", error=str(e))
         return
     emit_result(task_id, "success", data=data)
+
+
+def handle_ai_cli_status(task_id: str, params: dict):
+    from services.claude_suggest import get_ai_cli_status
+
+    emit_result(task_id, "success", data=get_ai_cli_status())
 
 
 def handle_find_moment(task_id: str, params: dict):
@@ -418,12 +583,24 @@ def handle_find_moment(task_id: str, params: dict):
 def handle_generate_content(task_id: str, params: dict):
     """Generate titles, descriptions, tags for a clip using PodStack knowledge base."""
     from services.content_generator import generate_clip_content
+    from services.claude_suggest import _find_ai_cli_candidates
 
     clip = params.get("clip", {})
     transcript_segments = params.get("transcript_segments", [])
 
     if not clip:
         emit_result(task_id, "error", error="clip is required")
+        return
+
+    if not _find_ai_cli_candidates():
+        emit_result(
+            task_id,
+            "error",
+            error=(
+                "No AI CLI available (install Claude Code or Codex). "
+                "If already installed, set the path in Config → AI CLI or PODCLI_CLAUDE_PATH."
+            ),
+        )
         return
 
     result = generate_clip_content(
@@ -434,6 +611,33 @@ def handle_generate_content(task_id: str, params: dict):
         partial_callback=lambda partial: emit_progress(
             task_id, "generating", 60, "Writing content...", partial=partial
         ),
+    )
+
+    if result is None:
+        emit_result(
+            task_id,
+            "error",
+            error="AI CLI found but content generation failed — check claude/codex login and try again",
+        )
+        return
+
+    emit_result(task_id, "success", data=result)
+
+
+def handle_generate_custom(task_id: str, params: dict):
+    """Run a free-form content request against the AI CLI with KB + transcript context."""
+    from services.content_generator import generate_custom_content
+
+    instruction = str(params.get("instruction", "")).strip()
+    if not instruction:
+        emit_result(task_id, "error", error="instruction is required")
+        return
+
+    result = generate_custom_content(
+        instruction=instruction,
+        transcript_segments=params.get("transcript_segments", []),
+        mode=params.get("mode", "shorts"),
+        progress_callback=lambda pct, msg: emit_progress(task_id, "generating", pct, msg),
     )
 
     if result is None:
@@ -522,6 +726,8 @@ TASK_HANDLERS = {
     "create_clip": handle_create_clip,
     "batch_clips": handle_batch_clips,
     "analyze_energy": handle_analyze_energy,
+    "detect_highlights": handle_detect_highlights,
+    "manage_reel": handle_manage_reel,
     "pack_transcript": handle_pack_transcript,
     "detect_encoder": handle_detect_encoder,
     "presets": handle_presets,
@@ -529,7 +735,9 @@ TASK_HANDLERS = {
     "suggest_clips": handle_suggest_clips,
     "find_moment": handle_find_moment,
     "manage_env": handle_manage_env,
+    "ai_cli_status": handle_ai_cli_status,
     "generate_content": handle_generate_content,
+    "generate_custom": handle_generate_custom,
     "manage_integrations": handle_manage_integrations,
     "run_integration_tool": handle_run_integration_tool,
     "manage_config": handle_manage_config,

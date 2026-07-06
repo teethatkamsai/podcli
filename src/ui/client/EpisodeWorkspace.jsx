@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Check,
   Heart as HeartGlyph,
@@ -11,10 +12,21 @@ import {
   Home as HomeGlyph,
   Users as UsersGlyph,
   Inbox,
+  X,
+  Plus,
+  Play,
+  Pencil,
+  Download,
+  Download as DownloadGlyph,
+  Activity,
+  ChevronRight,
+  ChevronDown,
+  ArrowRight,
 } from 'lucide-react';
 import CopyButton from './CopyButton';
 
 const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const isHttpUrl = (value) => /^https?:\/\//i.test(value.trim());
     const api = async (path, opts = {}) => {
       const res = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json', ...opts.headers }, ...opts });
       let body = null;
@@ -348,7 +360,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
               className={previewSrc ? '' : ''} />
           ) : (
             <div className="phone-empty">
-              <div style={{ fontSize: 22, opacity: 0.4 }}>{'▶'}</div>
+              <div style={{ opacity: 0.4, display: 'flex' }}><Play size={22} /></div>
               <div>Drop a video to see live caption preview</div>
             </div>
           )}
@@ -461,7 +473,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
             <div className="mcp-hints-subtitle">
               {collapsed ? `${hints.length} prompts` : 'Click to copy'}
             </div>
-            <span style={{ fontSize: 10, color: 'var(--text3)', transition: 'transform 0.2s', transform: collapsed ? 'rotate(-90deg)' : 'rotate(0)', marginLeft: 4 }}>{'\u25BC'}</span>
+            <span className="hint-xs" style={{ transition: 'transform 0.2s', transform: collapsed ? 'rotate(-90deg)' : 'rotate(0)', marginLeft: 4 }}><ChevronDown size={12} /></span>
           </div>
           {!collapsed && (
             <div className="mcp-hint-list">
@@ -495,15 +507,19 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
       const [transcriptMode, setTranscriptMode] = useState('whisper');
       const [transcriptText, setTranscriptText] = useState('');
       const [timeAdjust, setTimeAdjust] = useState(-1);
+      const [transcriptionEngine, setTranscriptionEngine] = useState('whisper');
+      const [assemblyAiKey, setAssemblyAiKey] = useState('');
       const [whisperModel, setWhisperModel] = useState('base');
       const [captionStyle, setCaptionStyle] = useState('branded');
       const [cropStrategy, setCropStrategy] = useState('face');
+      const [format, setFormat] = useState('vertical');
       const [showTikTokFrame, setShowTikTokFrame] = useState(false);
       const [logoPath, setLogoPath] = useState('');
       const logoRef = useRef();
       const [outroPath, setOutroPath] = useState('');
       const initializedRef = useRef(false);
       const outroRef = useRef();
+      const videoFileRef = useRef();
       const [outroUploading, setOutroUploading] = useState(false);
       const [transcriptDragOver, setTranscriptDragOver] = useState(false);
       const [transcriptFileName, setTranscriptFileName] = useState('');
@@ -528,6 +544,9 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
 
       const [logoUploading, setLogoUploading] = useState(false);
       const [browsing, setBrowsing] = useState(false);
+      const [downloadingVideo, setDownloadingVideo] = useState(false);
+      const [downloadJobId, setDownloadJobId] = useState(null);
+      const downloadStream = useJob(downloadJobId);
       const [clipHistory, setClipHistory] = useState([]);
       const [historyOpen, setHistoryOpen] = useState(false);
 
@@ -585,6 +604,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
           const d = response.config || response;
           if (d.caption_style) setCaptionStyle(d.caption_style);
           if (d.crop_strategy) setCropStrategy(d.crop_strategy);
+          if (d.format) setFormat(d.format);
           if (d.logo_path !== undefined) setLogoPath(d.logo_path || '');
           if (d.outro_path !== undefined) setOutroPath(d.outro_path || '');
           if (d.video_path !== undefined) {
@@ -601,6 +621,8 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
               setDeselected(new Set());
               setResults([]);
               setEnergyData({});
+              setPreviewSrc(null);
+              setActiveClipIdx(null);
               autoTranscribeRef.current = '';
               setPhase('idle');
             }
@@ -623,7 +645,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
         try {
           await api('/presets', { method: 'POST', body: JSON.stringify({
             action: 'save', name: presetName.trim(),
-            config: { caption_style: captionStyle, crop_strategy: cropStrategy, logo_path: logoPath, outro_path: outroPath, video_path: videoPath.trim(), whisper_model: whisperModel, time_adjust: timeAdjust, clean_fillers: cleanFillers, quality, top_clips: topClips, min_clip_duration: minDuration, max_clip_duration: maxDuration, energy_boost: energyBoost }
+            config: { caption_style: captionStyle, crop_strategy: cropStrategy, format, logo_path: logoPath, outro_path: outroPath, video_path: videoPath.trim(), whisper_model: whisperModel, time_adjust: timeAdjust, clean_fillers: cleanFillers, quality, top_clips: topClips, min_clip_duration: minDuration, max_clip_duration: maxDuration, energy_boost: energyBoost }
           })});
           setActivePreset(presetName.trim());
           setPresetName(''); setShowPresetSave(false);
@@ -705,7 +727,19 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
           const fileData = await api('/select-file', { method: 'POST', body: JSON.stringify({ file_path: vp }) });
           if (fileData.error) { setTranscribing(false); return; }
           setFile(fileData);
-          const data = await api('/transcribe', { method: 'POST', body: JSON.stringify({ file_path: vp, model_size: whisperModel, enable_diarization: speakerStatus?.configured || false }) });
+          const engine = transcriptionEngine === 'assemblyai' ? 'assemblyai' : undefined;
+          const data = await api('/transcribe', { method: 'POST', body: JSON.stringify({
+            file_path: vp,
+            model_size: whisperModel,
+            engine,
+            assemblyai_api_key: transcriptionEngine === 'assemblyai' ? assemblyAiKey.trim() : undefined,
+            enable_diarization: transcriptionEngine === 'assemblyai' || (speakerStatus?.configured || false),
+          }) });
+          if (data.error) {
+            setError(data.error);
+            setTranscribing(false);
+            return;
+          }
           if (data.cached && data.data) {
             // Instant cache hit
             setTranscript(data.data);
@@ -733,15 +767,15 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
         }
       }, [transcribeStream?.status]);
 
-      // Auto-trigger transcribe when video path is set and mode is whisper
+      // Auto-trigger transcribe when video path is set and auto transcript mode is active
       const autoTranscribeRef = useRef('');
       useEffect(() => {
         const vp = videoPath.trim();
-        if (transcriptMode === 'whisper' && vp && !transcript && !transcribing && vp !== autoTranscribeRef.current) {
+        if (transcriptMode === 'whisper' && transcriptionEngine === 'whisper' && vp && !isHttpUrl(vp) && !transcript && !transcribing && vp !== autoTranscribeRef.current) {
           autoTranscribeRef.current = vp;
           autoTranscribe(vp);
         }
-      }, [videoPath, transcriptMode, transcript, transcribing]);
+      }, [videoPath, transcriptMode, transcriptionEngine, transcript, transcribing]);
 
       // Fetch clip history on mount and after exports
       const fetchHistory = () => { fetch('/api/history?limit=50').then(r => r.json()).then(d => { if (Array.isArray(d)) setClipHistory(d); }).catch(() => { }); };
@@ -762,14 +796,16 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
           filePath: file?.file_path || '',
           suggestions,
           deselectedIndices: Array.from(deselected),
-          settings: { captionStyle, cropStrategy, logoPath, outroPath },
+          settings: { captionStyle, cropStrategy, format, logoPath, outroPath },
           phase,
+          results,
+          energyData,
         };
         const key = JSON.stringify(state);
         if (key === prevSyncRef.current) return;
         prevSyncRef.current = key;
         fetch('/api/ui-state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: key }).catch(() => { });
-      }, [videoPath, file, suggestions, deselected, captionStyle, cropStrategy, logoPath, outroPath, phase]);
+      }, [videoPath, file, suggestions, deselected, captionStyle, cropStrategy, format, logoPath, outroPath, phase, results, energyData]);
 
       // Sync transcript separately (large payload)
       const prevTranscriptRef = useRef(null);
@@ -799,17 +835,26 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
 
         if (sseEvent.type === 'state-sync' || sseEvent.type === 'state') {
           const d = sseEvent.data;
-          if (d.suggestions) { setSuggestions(d.suggestions); setEnergyData({}); }
+          if (d.suggestions) {
+            setSuggestions(d.suggestions);
+            setEnergyData(sseEvent.type === 'state' && d.energyData ? d.energyData : {});
+          }
           if (d.deselectedIndices !== undefined) setDeselected(new Set(d.deselectedIndices));
           else if (d.suggestions && !d.deselectedIndices) setDeselected(new Set());
           if (d.phase) setPhase(d.phase);
-          if (d.activeExportJobId) setBatchJobId(d.activeExportJobId);
+          if (sseEvent.type === 'state' && Array.isArray(d.results)) setResults(d.results);
+          if (d.activeExportJobId !== undefined) setBatchJobId(d.activeExportJobId);
           if (d.videoPath !== undefined) setVideoPath(d.videoPath);
-          if (d.transcript) { setTranscript(d.transcript); if (d.videoPath) autoTranscribeRef.current = d.videoPath; }
-          if (d.rawTranscriptText && !transcript) setTranscriptText(d.rawTranscriptText);
+          if (d.transcript !== undefined) {
+            setTranscript(d.transcript);
+            if (d.videoPath) autoTranscribeRef.current = d.videoPath;
+            if (d.transcript === null) autoTranscribeRef.current = '';
+          }
+          if (d.rawTranscriptText !== undefined && (d.transcript === null || !transcript)) setTranscriptText(d.rawTranscriptText);
           if (d.settings) {
             if (d.settings.captionStyle) setCaptionStyle(d.settings.captionStyle);
             if (d.settings.cropStrategy) setCropStrategy(d.settings.cropStrategy);
+            if (d.settings.format) setFormat(d.settings.format);
             if (d.settings.logoPath !== undefined) setLogoPath(d.settings.logoPath);
             if (d.settings.outroPath !== undefined) setOutroPath(d.settings.outroPath);
           }
@@ -846,7 +891,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
       // Video source URL
       const videoUrl = previewSrc
         ? `/api/preview/${previewSrc}`
-        : videoPath
+        : videoPath && !isHttpUrl(videoPath)
           ? `/api/stream-source?path=${encodeURIComponent(videoPath)}`
           : null;
 
@@ -871,6 +916,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
 
       const onCaptionChange = (v) => { setCaptionStyle(v); flashSetting('caption'); };
       const onCropChange = (v) => { setCropStrategy(v); flashSetting('crop'); };
+      const onFormatChange = (v) => { setFormat(v); flashSetting('format'); };
 
       // Click clip row → seek source video
       const onClipClick = (idx) => {
@@ -884,15 +930,71 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
         setActiveClipIdx(null);
       };
 
-      // Native file browse
-      const doBrowse = useCallback(async () => {
-        setBrowsing(true);
+      const setUploadedVideo = useCallback(async (file) => {
+        if (!file) return;
+        setBrowsing(true); setError(null);
         try {
-          const d = await api('/browse-file');
+          const d = await uploadFile(file, () => { });
+          if (d.error) setError(d.error);
           if (d.file_path) setVideoPath(d.file_path);
-        } catch (e) { setError('Browse failed: ' + e.message); }
+        } catch (e) { setError('Upload failed: ' + e.message); }
         finally { setBrowsing(false); }
       }, []);
+
+      const doBrowse = useCallback(() => {
+        videoFileRef.current?.click();
+      }, []);
+
+      const handleVideoFileSelect = (e) => {
+        const f = e.target.files?.[0];
+        e.target.value = '';
+        setUploadedVideo(f);
+      };
+
+      const downloadVideo = async () => {
+        const url = videoPath.trim();
+        if (!url || downloadingVideo) return;
+        setDownloadingVideo(true); setError(null);
+        try {
+          const d = await api('/download-video', { method: 'POST', body: JSON.stringify({ url }) });
+          if (d.error) { setError(d.error); setDownloadingVideo(false); return; }
+          if (d.job_id) { setDownloadJobId(d.job_id); return; }
+          setError('Download failed: missing job id');
+          setDownloadingVideo(false);
+        } catch (e) { setError('Download failed: ' + e.message); setDownloadingVideo(false); }
+      };
+
+      useEffect(() => {
+        if (!downloadStream) return;
+        if (downloadStream.status === 'done') {
+          const d = downloadStream.result;
+          if (!d?.file_path) {
+            setError('Download finished without a video file.');
+            setDownloadingVideo(false);
+            setDownloadJobId(null);
+            return;
+          }
+          setFile(d);
+          setVideoPath(d.file_path);
+          setTranscript(null);
+          setCachedTranscript(false);
+          setTranscriptText('');
+          setTranscriptFileName('');
+          setSuggestions([]);
+          setDeselected(new Set());
+          setResults([]);
+          setEnergyData({});
+          setPreviewSrc(null);
+          setActiveClipIdx(null);
+          autoTranscribeRef.current = '';
+          setDownloadingVideo(false);
+          setDownloadJobId(null);
+        } else if (downloadStream.status === 'error') {
+          setError('Download failed: ' + (downloadStream.error || 'Unknown error'));
+          setDownloadingVideo(false);
+          setDownloadJobId(null);
+        }
+      }, [downloadStream?.status]);
 
       const findMoment = async () => {
         const text = momentText.trim();
@@ -922,7 +1024,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
         const data = await api('/batch-clips', {
           method: 'POST', body: JSON.stringify({
             video_path: vp,
-            clips: sc.map(c => ({ start_second: c.start_second, end_second: c.end_second, title: c.title.slice(0, 40), caption_style: captionStyle, crop_strategy: cropStrategy })),
+            clips: sc.map(c => ({ start_second: c.start_second, end_second: c.end_second, title: c.title.slice(0, 40), caption_style: captionStyle, crop_strategy: cropStrategy, format })),
             transcript_words: transcript?.words || [], logo_path: logoPath || undefined, outro_path: outroPath || undefined, clean_fillers: cleanFillers || undefined,
           })
         });
@@ -941,7 +1043,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
         const data = await api('/create-clip', {
           method: 'POST', body: JSON.stringify({
             video_path: vp, start_second: c.start_second, end_second: c.end_second,
-            title: c.title.slice(0, 40), caption_style: captionStyle, crop_strategy: cropStrategy,
+            title: c.title.slice(0, 40), caption_style: captionStyle, crop_strategy: cropStrategy, format,
             transcript_words: transcript?.words || [], logo_path: logoPath || undefined, outro_path: outroPath || undefined, clean_fillers: cleanFillers || undefined,
           })
         });
@@ -981,7 +1083,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
           parts.push('Then call suggest_clips with your suggestions.');
         }
         const settings = [];
-        if (videoPath) settings.push(`Video: ${videoPath.split('/').pop()}`);
+        if (videoPath) settings.push(`Video: ${videoPath.split(/[\\/]/).pop()}`);
         settings.push(`Style: ${captionStyle}`);
         settings.push(`Crop: ${cropStrategy}`);
         if (logoPath) settings.push(`Logo: set`);
@@ -991,6 +1093,11 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
       };
 
       const copyGeneratePrompt = async () => {
+        if (isProcessing) return;
+        if (sourceIsUrl) {
+          setError('Download the video first, then find best moments.');
+          return;
+        }
         // If user has pasted a transcript but it hasn't been parsed yet, parse it first
         if (transcriptMode === 'import' && transcriptText.trim() && !transcript) {
           setError(null);
@@ -1031,7 +1138,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
               _source: 'ui',
               videoPath: videoPath.trim(),
               rawTranscriptText: transcriptText.trim() || undefined,
-              settings: { captionStyle, cropStrategy, logoPath, outroPath },
+              settings: { captionStyle, cropStrategy, format, logoPath, outroPath },
             }),
           }).catch(() => { });
         }
@@ -1090,7 +1197,8 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
         }
       };
 
-      const isProcessing = phase === 'parsing' || phase === 'suggesting' || phase === 'exporting' || transcribing;
+      const isProcessing = phase === 'parsing' || phase === 'suggesting' || phase === 'exporting' || transcribing || downloadingVideo;
+      const sourceIsUrl = isHttpUrl(videoPath);
       const selectedClips = suggestions.filter((_, i) => !deselected.has(i));
 
       const getExportStatus = (resultIdx) => {
@@ -1103,7 +1211,11 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
         return 'pending';
       };
 
-      const handleVideoDrop = (e) => { e.preventDefault(); };
+      const handleVideoDrop = (e) => {
+        e.preventDefault();
+        const f = e.dataTransfer?.files?.[0];
+        setUploadedVideo(f);
+      };
       const handleTranscriptDrop = (e) => { e.preventDefault(); setTranscriptDragOver(false); const files = e.dataTransfer?.files; if (!files?.length) return; const f = files[0]; setTranscriptFileName(f.name); const reader = new FileReader(); reader.onload = (ev) => setTranscriptText(ev.target.result); reader.readAsText(f); };
       const handleTranscriptFileSelect = (e) => { const f = e.target.files?.[0]; if (!f) return; setTranscriptFileName(f.name); const reader = new FileReader(); reader.onload = (ev) => setTranscriptText(ev.target.result); reader.readAsText(f); };
       const preventDef = (e) => e.preventDefault();
@@ -1129,12 +1241,12 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                   <span className="pill" style={{ fontSize: 10, letterSpacing: '0.5px', background: 'rgba(250,204,21,0.08)', color: '#facc15', border: '1px solid rgba(250,204,21,0.2)', cursor: 'pointer' }}
                     title="Speaker detection not configured. Click to learn more"
                     onClick={() => window.open('https://huggingface.co/pyannote/speaker-diarization-3.1', '_blank')}>
-                    Speakers ✗
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>Speakers <X size={11} /></span>
                   </span>
                 )}
                 {speakerStatus && speakerStatus.configured && (
                   <span className="pill" style={{ fontSize: 10, letterSpacing: '0.5px', background: 'var(--green-subtle)', color: 'var(--green)', border: '1px solid var(--green-border)' }}>
-                    Speakers ✓
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>Speakers <Check size={11} /></span>
                   </span>
                 )}
               </div>
@@ -1146,19 +1258,19 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
             <div className="fade-in" style={{ margin: '0 0 16px', padding: '14px 16px', background: 'rgba(250,204,21,0.06)', border: '1px solid rgba(250,204,21,0.15)', borderRadius: 'var(--radius)', display: 'flex', alignItems: 'flex-start', gap: 12 }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>Set up speaker detection</div>
-                <div style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.5 }}>
+                <div className="meta">
                   Identify who's talking in your podcast. Free, takes 2 minutes.
                   <br/>
                   <span style={{ color: 'var(--text3)' }}>1.</span> <a href="https://huggingface.co/pyannote/speaker-diarization-3.1" target="_blank" rel="noopener" style={{ color: '#facc15', textDecoration: 'none' }}>Accept model terms</a>
                   {' → '}
-                  <span style={{ color: 'var(--text3)' }}>2.</span> <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener" style={{ color: '#facc15', textDecoration: 'none' }}>Get free token</a> <span style={{ fontSize: 10, color: 'var(--text3)' }}>(Read permission)</span>
+                  <span style={{ color: 'var(--text3)' }}>2.</span> <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener" style={{ color: '#facc15', textDecoration: 'none' }}>Get free token</a> <span className="hint-xs">(Read permission)</span>
                   {' → '}
                   <span style={{ color: 'var(--text3)' }}>3.</span> Add <code style={{ fontFamily: 'var(--font-mono)', fontSize: 11, padding: '1px 5px', background: 'rgba(250,204,21,0.1)', borderRadius: 4, color: '#facc15' }}>HF_TOKEN=hf_...</code> to your <code style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>.env</code>
                 </div>
               </div>
               <button onClick={() => { sessionStorage.setItem('dismiss-speaker', '1'); setSpeakerStatus({...speakerStatus, _dismissed: true}); }}
                 style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', fontSize: 16, padding: 4, lineHeight: 1 }}
-                title="Dismiss">✕</button>
+                title="Dismiss"><X size={12} /></button>
             </div>
           )}
 
@@ -1167,11 +1279,12 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
             <div className="main-col">
 
               {/* Video */}
-              <div className="section">
+              <div className="section card">
                 <div className="section-label">Video</div>
                 {!videoPath && (
                   <div className="drop-zone" style={{ cursor: 'pointer' }} onClick={browsing || isProcessing ? undefined : doBrowse}
                     onDragOver={preventDef} onDrop={handleVideoDrop}>
+                    <input ref={videoFileRef} type="file" accept=".mp4,.mov,.mkv,.webm,.mp3,.wav,.m4a" onChange={handleVideoFileSelect} style={{ display: 'none' }} />
                     {browsing ? (
                       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                         <div className="spinner sm" />
@@ -1184,25 +1297,36 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                     )}
                   </div>
                 )}
-                {videoPath && (
+                {videoPath && !sourceIsUrl && (
                   <div className="file-badge fade-in">
                     <div className="dot" />
-                    <div className="name">{videoPath.split('/').pop()}</div>
+                    <div className="name">{videoPath.split(/[\\/]/).pop()}</div>
                     <button className="btn btn-ghost btn-sm" onClick={() => setVideoPath('')} style={{ padding: '4px 10px', fontSize: 11 }}>Clear</button>
                   </div>
                 )}
-                <input type="text" placeholder="Or paste a local path: /Users/you/episode.mp4"
-                  value={videoPath} onChange={e => setVideoPath(e.target.value)}
-                  disabled={isProcessing || browsing}
-                  style={{ marginTop: 8, fontSize: 12, padding: '9px 13px', background: 'var(--bg)', borderColor: videoPath ? 'var(--green-border)' : 'var(--border)' }} />
+                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                  <input type="text" placeholder="Paste a local path or YouTube/video URL"
+                    value={videoPath} onChange={e => setVideoPath(e.target.value)}
+                    disabled={isProcessing || browsing}
+                    onKeyDown={e => { if (e.key === 'Enter' && sourceIsUrl) downloadVideo(); }}
+                    style={{ flex: 1, fontSize: 12, padding: '9px 13px', background: 'var(--bg)', borderColor: videoPath ? 'var(--green-border)' : 'var(--border)' }} />
+                  <button className="btn btn-ghost btn-sm" onClick={downloadVideo} disabled={!sourceIsUrl || isProcessing || browsing}>
+                    {downloadingVideo ? <div className="spinner sm" /> : <><DownloadGlyph size={14} /> Download</>}
+                  </button>
+                </div>
+                {downloadingVideo && (
+                  <div className="progress-track" style={{ marginTop: 6 }}>
+                    <div className="progress-fill" style={{ width: `${downloadStream?.progress || 5}%` }} />
+                  </div>
+                )}
               </div>
 
               {/* Transcript */}
-              <div className="section">
+              <div className="section card">
                 <div className="section-label">Transcript</div>
                 <div className="tabs">
                   <div className={`tab ${transcriptMode === 'import' ? 'active' : ''}`} onClick={() => setTranscriptMode('import')}>Paste transcript</div>
-                  <div className={`tab ${transcriptMode === 'whisper' ? 'active' : ''}`} onClick={() => setTranscriptMode('whisper')}>Auto (Whisper)</div>
+                  <div className={`tab ${transcriptMode === 'whisper' ? 'active' : ''}`} onClick={() => setTranscriptMode('whisper')}>Auto</div>
                 </div>
                 {transcriptMode === 'import' && (
                   <div className="fade-in">
@@ -1221,28 +1345,47 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                         <button className="btn btn-ghost btn-sm" onClick={() => { setTranscriptText(''); setTranscriptFileName(''); }} style={{ padding: '4px 10px', fontSize: 11 }}>Clear</button>
                       </div>
                     )}
-                    <textarea placeholder={'Speaker (00:00)\nText of what they said...\n\nSpeaker2 (00:15)\nMore text...\n\nOr paste JSON / drag a .txt file above.'}
+                    <textarea className="code-input" placeholder={'Speaker (00:00)\nText of what they said...\n\nSpeaker2 (00:15)\nMore text...\n\nOr paste JSON / drag a .txt file above.'}
                       value={transcriptText} onChange={e => { setTranscriptText(e.target.value); setTranscriptFileName(''); }}
                       disabled={isProcessing} style={{ minHeight: transcriptText ? 80 : 120 }}
                       onDragOver={e => { preventDef(e); setTranscriptDragOver(true); }} onDrop={handleTranscriptDrop} />
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10 }}>
-                      <span style={{ fontSize: 12, color: 'var(--text2)', whiteSpace: 'nowrap' }}>Time offset</span>
+                      <span className="meta" style={{ whiteSpace: 'nowrap' }}>Time offset</span>
                       <input type="number" step="0.5" value={timeAdjust} onChange={e => setTimeAdjust(parseFloat(e.target.value) || 0)}
-                        style={{ width: 72, padding: '7px 10px', fontSize: 12 }} disabled={isProcessing} />
-                      <span style={{ fontSize: 11, color: 'var(--text3)' }}>sec</span>
+                        style={{ width: 72 }} disabled={isProcessing} />
+                      <span className="hint">sec</span>
                     </div>
                   </div>
                 )}
                 {transcriptMode === 'whisper' && (
                   <div className="fade-in">
-                    <div className="row" style={{ marginBottom: 10 }}><div>
-                      <label className="field-label">Model</label>
-                      <select value={whisperModel} onChange={e => setWhisperModel(e.target.value)} disabled={isProcessing || transcribing}>
-                        <option value="tiny">Tiny (fastest)</option><option value="base">Base</option>
-                        <option value="small">Small</option><option value="medium">Medium</option>
-                        <option value="large">Large (best)</option>
-                      </select>
-                    </div></div>
+                    <div className="row" style={{ marginBottom: 10 }}>
+                      <div>
+                        <label className="field-label">Engine</label>
+                        <select value={transcriptionEngine} onChange={e => { setTranscriptionEngine(e.target.value); setTranscript(null); setCachedTranscript(false); autoTranscribeRef.current = ''; }} disabled={isProcessing || transcribing}>
+                          <option value="whisper">Whisper</option>
+                          <option value="assemblyai">AssemblyAI</option>
+                        </select>
+                      </div>
+                      {transcriptionEngine === 'whisper' && (
+                        <div>
+                          <label className="field-label">Model</label>
+                          <select value={whisperModel} onChange={e => setWhisperModel(e.target.value)} disabled={isProcessing || transcribing}>
+                            <option value="tiny">Tiny (fastest)</option><option value="base">Base</option>
+                            <option value="small">Small</option><option value="medium">Medium</option>
+                            <option value="large">Large (best)</option>
+                          </select>
+                        </div>
+                      )}
+                    </div>
+                    {transcriptionEngine === 'assemblyai' && (
+                      <div style={{ marginBottom: 10 }}>
+                        <label className="field-label">AssemblyAI API key</label>
+                        <input type="password" value={assemblyAiKey} onChange={e => setAssemblyAiKey(e.target.value)}
+                          placeholder="aai_..." disabled={isProcessing || transcribing}
+                          style={{ fontSize: 12, padding: '9px 13px' }} />
+                      </div>
+                    )}
 
                     {/* Transcription progress */}
                     {transcribing && !cachedTranscript && (
@@ -1293,18 +1436,18 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
               </div>
 
               {/* Settings */}
-              <div className="section">
+              <div className="section card">
                 <div className="section-label">Settings</div>
 
                 {/* Presets */}
                 {presets.length > 0 && (
                   <div className="preset-bar">
-                    <select value={activePreset} onChange={e => loadPreset(e.target.value)} disabled={isProcessing} style={{ fontSize: 12 }}>
+                    <select value={activePreset} onChange={e => loadPreset(e.target.value)} disabled={isProcessing}>
                       <option value="">Load preset…</option>
                       {presets.map(p => <option key={p.name || p} value={p.name || p}>{p.name || p}</option>)}
                     </select>
                     {activePreset && (
-                      <button className="btn btn-ghost btn-sm" onClick={() => deletePreset(activePreset)} title="Delete preset" style={{ padding: '6px 8px', color: 'var(--red)' }}>{'\u00D7'}</button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => deletePreset(activePreset)} title="Delete preset" style={{ padding: '6px 8px', color: 'var(--red)' }}><X size={14} /></button>
                     )}
                   </div>
                 )}
@@ -1321,7 +1464,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                 ) : (
                   <div style={{ marginBottom: 14 }}>
                     <button className="asset-add" onClick={() => setShowPresetSave(true)} disabled={isProcessing}>
-                      + Save as preset
+                      <Plus size={12} /> Save as preset
                     </button>
                   </div>
                 )}
@@ -1340,6 +1483,12 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                       <option value="speaker">Speaker aware</option><option value="face">Face detection</option><option value="center">Center</option>
                     </select>
                   </div>
+                  <div>
+                    <label className="field-label">Format</label>
+                    <select value={format} onChange={e => onFormatChange(e.target.value)} disabled={isProcessing}>
+                      <option value="vertical">Vertical 9:16</option><option value="horizontal">Horizontal 16:9</option><option value="square">Square 1:1</option>
+                    </select>
+                  </div>
                 </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   {captionStyle === 'branded' && (
@@ -1350,23 +1499,23 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                             style={{ width: 16, height: 16, objectFit: 'contain', borderRadius: 3 }} onError={e => { e.target.style.display = 'none' }} />
                         </span>
                         <span className="asset-pill-name">{logoPath.split('/').pop()}</span>
-                        <button className="asset-pill-x" onClick={() => setLogoPath('')} disabled={isProcessing}>{'\u00D7'}</button>
+                        <button className="asset-pill-x" onClick={() => setLogoPath('')} disabled={isProcessing}><X size={12} /></button>
                       </div>
                     ) : (
                       <button className="asset-add fade-in" onClick={() => logoRef.current?.click()} disabled={isProcessing || logoUploading}>
-                        {logoUploading ? <div className="spinner sm" /> : '+'} Logo
+                        {logoUploading ? <div className="spinner sm" /> : <Plus size={12} />} Logo
                       </button>
                     )
                   )}
                   {outroPath ? (
                     <div className="asset-pill">
-                      <span className="asset-pill-icon" style={{ fontSize: 11 }}>{'▶'}</span>
+                      <span className="asset-pill-icon" style={{ display: 'inline-flex' }}><Play size={11} /></span>
                       <span className="asset-pill-name">{outroPath.split('/').pop()}</span>
-                      <button className="asset-pill-x" onClick={() => setOutroPath('')} disabled={isProcessing}>{'\u00D7'}</button>
+                      <button className="asset-pill-x" onClick={() => setOutroPath('')} disabled={isProcessing}><X size={12} /></button>
                     </div>
                   ) : (
                     <button className="asset-add" onClick={() => outroRef.current?.click()} disabled={isProcessing || outroUploading}>
-                      {outroUploading ? <div className="spinner sm" /> : '+'} Outro
+                      {outroUploading ? <div className="spinner sm" /> : <Plus size={12} />} Outro
                     </button>
                   )}
                   <input ref={logoRef} type="file" accept=".png,.jpg,.jpeg,.svg" style={{ display: 'none' }}
@@ -1379,14 +1528,14 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                 <div style={{ marginTop: 14 }}>
                   <div style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, fontWeight: 700, letterSpacing: '0.8px', color: 'var(--text2)', textTransform: 'uppercase' }}
                     onClick={() => setAdvancedOpen(!advancedOpen)}>
-                    <span style={{ fontSize: 10, transition: 'transform 0.15s', transform: advancedOpen ? 'rotate(90deg)' : 'rotate(0deg)', display: 'inline-block' }}>▶</span>
+                    <span style={{ transition: 'transform 0.15s', transform: advancedOpen ? 'rotate(90deg)' : 'rotate(0deg)', display: 'inline-flex' }}><ChevronRight size={12} /></span>
                     Advanced
                   </div>
                   {advancedOpen && (
                     <div className="advanced-grid fade-in">
                       <div className="field">
                         <label className="field-label">Quality</label>
-                        <select value={quality} onChange={e => setQuality(e.target.value)} disabled={isProcessing} style={{ fontSize: 12, padding: '8px 12px' }}>
+                        <select value={quality} onChange={e => setQuality(e.target.value)} disabled={isProcessing}>
                           <option value="max">Max</option><option value="high">High</option><option value="fast">Fast</option>
                         </select>
                       </div>
@@ -1427,23 +1576,23 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
               {/* Word Corrections */}
               <div className="section">
                 <div className="section-label" style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }} onClick={() => setCorrectionsOpen(!correctionsOpen)}>
-                  <span style={{ fontSize: 10, transition: 'transform 0.15s', transform: correctionsOpen ? 'rotate(90deg)' : 'rotate(0deg)', display: 'inline-block' }}>▶</span>
+                  <span style={{ transition: 'transform 0.15s', transform: correctionsOpen ? 'rotate(90deg)' : 'rotate(0deg)', display: 'inline-flex' }}><ChevronRight size={12} /></span>
                   Word Corrections
                   {Object.keys(corrections).length > 0 && (
-                    <span style={{ fontSize: 10, color: 'var(--text3)', fontWeight: 400 }}>({Object.keys(corrections).length})</span>
+                    <span className="hint-xs" style={{ fontWeight: 400 }}>({Object.keys(corrections).length})</span>
                   )}
                 </div>
                 {correctionsOpen && (
                   <div className="fade-in" style={{ marginTop: 8 }}>
-                    <div style={{ fontSize: 11, color: 'var(--text3)', marginBottom: 8, lineHeight: 1.4 }}>
+                    <div className="hint" style={{ marginBottom: 8, lineHeight: 1.4 }}>
                       Fix Whisper misheard words. Applied automatically to all transcripts.
                     </div>
                     <div style={{ display: 'flex', gap: 6, marginBottom: 8, alignItems: 'center' }}>
                       <input value={correctionWord} onChange={e => setCorrectionWord(e.target.value)}
-                        placeholder="Wrong (e.g. Boxel)" style={{ flex: 1, fontSize: 12, padding: '8px 12px', background: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }} />
-                      <span style={{ color: 'var(--text3)', fontSize: 12, flexShrink: 0 }}>{'\u2192'}</span>
+                        placeholder="Wrong (e.g. Boxel)" style={{ flex: 1 }} />
+                      <span style={{ color: 'var(--text3)', display: 'inline-flex', flexShrink: 0 }}><ArrowRight size={12} /></span>
                       <input value={correctionFix} onChange={e => setCorrectionFix(e.target.value)}
-                        placeholder="Correct (e.g. Voxel)" style={{ flex: 1, fontSize: 12, padding: '8px 12px', background: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}
+                        placeholder="Correct (e.g. Voxel)" style={{ flex: 1 }}
                         onKeyDown={e => { if (e.key === 'Enter' && correctionWord.trim() && correctionFix.trim()) {
                           api('/corrections/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ wrong: correctionWord.trim(), correct: correctionFix.trim() }) })
                             .then(d => { if (d.corrections) { setCorrections(d.corrections); setCorrectionWord(''); setCorrectionFix(''); } });
@@ -1458,12 +1607,12 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                         {Object.entries(corrections).map(([wrong, correct]) => (
                           <div key={wrong} className="asset-pill" style={{ fontSize: 11 }}>
                             <span style={{ color: 'var(--text3)', textDecoration: 'line-through' }}>{wrong}</span>
-                            <span style={{ color: 'var(--text3)', margin: '0 2px' }}>→</span>
+                            <span style={{ color: 'var(--text3)', margin: '0 2px', display: 'inline-flex' }}><ArrowRight size={12} /></span>
                             <span style={{ color: 'var(--green)' }}>{correct}</span>
                             <button className="asset-pill-x" onClick={() => {
                               fetch(`/api/corrections/${encodeURIComponent(wrong)}`, { method: 'DELETE' })
                                 .then(r => r.json()).then(d => { if (d.corrections) setCorrections(d.corrections); });
-                            }}>{'\u00D7'}</button>
+                            }}><X size={12} /></button>
                           </div>
                         ))}
                       </div>
@@ -1483,8 +1632,13 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
               {/* Generate */}
               {phase === 'idle' && (
                 <div>
+                  {sourceIsUrl && (
+                    <div style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 8 }}>
+                      Download the video first, then find best moments.
+                    </div>
+                  )}
                   <button className="btn btn-go"
-                    disabled={!videoPath.trim() || (transcriptMode === 'import' && !transcriptText.trim()) || (transcriptMode === 'whisper' && !transcript) || browsing || transcribing}
+                    disabled={isProcessing || sourceIsUrl || !videoPath.trim() || (transcriptMode === 'import' && !transcriptText.trim()) || (transcriptMode === 'whisper' && !transcript) || browsing || transcribing}
                     onClick={copyGeneratePrompt}
                     style={generateCopied ? { background: 'var(--green)', transition: 'background 0.2s' } : {}}>
                     {phase === 'suggesting' ? 'Claude is analyzing...' : generateCopied ? 'Copied. Paste in Claude' : 'Find best moments'}
@@ -1506,7 +1660,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                     value={momentText}
                     onChange={(e) => { setMomentText(e.target.value); setMomentNotice(null); }}
                     disabled={findingMoment}
-                    style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+                    style={{ width: '100%', resize: 'vertical' }}
                   />
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8 }}>
                     <button className="btn btn-primary btn-sm" onClick={findMoment} disabled={!momentText.trim() || findingMoment}>
@@ -1540,25 +1694,25 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                 <div>
                   <div className="spacer" />
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-                    <div className="section-label" style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div className="section-label" style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8, fontVariantNumeric: 'tabular-nums' }}>
                       {phase === 'suggesting' && <div className="spinner sm" />}
                       {phase === 'suggesting' ? `Found ${suggestions.length} clip${suggestions.length !== 1 ? 's' : ''}`
                         : phase === 'review' ? `Clips \u00B7 ${selectedCount} selected` : 'Clips'}
                     </div>
                     <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                       {phase === 'review' && videoPath && (
-                        <button className="energy-btn" onClick={analyzeEnergy} disabled={analyzingEnergy || suggestions.length === 0} title="Analyze audio energy levels">
-                          {analyzingEnergy ? <><div className="spinner sm" /> Analyzing…</> : '⚡ Energy'}
+                        <button className="btn btn-ghost btn-sm" onClick={analyzeEnergy} disabled={analyzingEnergy || suggestions.length === 0} title="Analyze audio energy levels">
+                          {analyzingEnergy ? <><div className="spinner sm" /> Analyzing…</> : <><Activity size={14} /> Energy</>}
                         </button>
                       )}
                       {phase === 'review' && (
-                        <button className="btn btn-primary btn-sm" disabled={selectedCount === 0} onClick={startExport}>
+                        <button className="btn btn-primary btn-sm" disabled={selectedCount === 0} onClick={startExport} style={{ fontVariantNumeric: 'tabular-nums' }}>
                           Export {selectedCount} clip{selectedCount !== 1 ? 's' : ''}
                         </button>
                       )}
                       {transcript && (phase === 'review' || phase === 'done') && (
                         <div style={{ position: 'relative' }}>
-                          <button className="btn btn-ghost btn-sm overflow-menu-btn" onClick={e => { const m = e.currentTarget.nextElementSibling; m.style.display = m.style.display === 'block' ? 'none' : 'block'; }} style={{ padding: '4px 8px', fontSize: 14, color: 'var(--text3)', lineHeight: 1 }}>
+                          <button className="btn btn-ghost btn-sm overflow-menu-btn" onClick={e => { const m = e.currentTarget.nextElementSibling; m.style.display = m.style.display === 'block' ? 'none' : 'block'; }} style={{ padding: '6px 10px', fontSize: 14, color: 'var(--text3)', lineHeight: 1 }}>
                             {'\u22EF'}
                           </button>
                           <div className="overflow-menu" style={{ display: 'none' }}>
@@ -1600,7 +1754,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                         )}
 
                         {phase === 'done' && !off && r && (
-                          <div className={`status-dot ${failed ? 'fail' : 'ok'}`}>{failed ? '\u00D7' : '\u2713'}</div>
+                          <div className={`status-dot ${failed ? 'fail' : 'ok'}`}>{failed ? <X size={11} /> : <Check size={11} />}</div>
                         )}
 
                         <div className="clip-info">
@@ -1609,7 +1763,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                             {fmt(clip.start_second)} {'\u2192'} {fmt(clip.end_second)} {'\u00B7'} {clip.duration}s
                             {energyData[i] && (
                               <span className={`energy-badge ${energyData[i].level}`} title={`Energy: ${energyData[i].score}/10`}>
-                                {energyData[i].level === 'high' ? '⚡' : energyData[i].level === 'medium' ? '~' : '○'} {energyData[i].score.toFixed(1)}
+                                {energyData[i].level === 'high' ? <Activity size={10} /> : energyData[i].level === 'medium' ? '~' : '○'} {energyData[i].score.toFixed(1)}
                               </span>
                             )}
                             {r && !failed && <span> {'\u00B7'} {r.file_size_mb}MB</span>}
@@ -1619,13 +1773,13 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                         </div>
 
                         {phase === 'review' && (
-                          <button className="btn btn-ghost btn-sm clip-edit-btn" onClick={(e) => openClipEdit(i, e)} title="Edit clip">✎</button>
+                          <button className="btn btn-ghost btn-sm clip-edit-btn" onClick={(e) => openClipEdit(i, e)} title="Edit clip"><Pencil size={13} /></button>
                         )}
 
                         {phase === 'done' && !off && r && !failed && outputFile && (
                           <div className="clip-actions" onClick={e => e.stopPropagation()}>
-                            <button className="btn btn-ghost btn-sm" onClick={() => onPlayRendered(outputFile)} title="Preview">{'\u25B6'}</button>
-                            <a href={`/api/download/${outputFile}`} className="btn btn-primary btn-sm" download title="Download">{'\u2193'}</a>
+                            <button className="btn btn-ghost btn-sm" onClick={() => onPlayRendered(outputFile)} title="Preview"><Play size={13} /></button>
+                            <a href={`/api/download/${outputFile}`} className="btn btn-primary btn-sm" download title="Download"><Download size={14} /></a>
                             <button className="btn btn-ghost btn-sm" disabled={isRetryingThis} onClick={() => retryClip(resultIdx)} title="Retry">{'\u21BB'}</button>
                           </div>
                         )}
@@ -1677,7 +1831,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                         <div style={{ width: 20, height: 20, borderRadius: 6, background: 'rgba(74,222,128,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, color: 'var(--green)' }}>P</div>
                         <span style={{ fontSize: 13, fontWeight: 700 }}>PodStack: next steps</span>
                       </div>
-                      <p style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.6, marginBottom: 12 }}>
+                      <p className="meta" style={{ lineHeight: 1.6, marginBottom: 12 }}>
                         Clips are rendered. Now generate titles, descriptions, and thumbnails in Claude Code:
                       </p>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -1706,7 +1860,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                   <div className="section-label" style={{ cursor: 'pointer', userSelect: 'none', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
                     onClick={() => setHistoryOpen(!historyOpen)}>
                     <span>History ({clipHistory.length})</span>
-                    <span style={{ fontSize: 10, color: 'var(--text3)', transition: 'transform 0.2s', transform: historyOpen ? 'rotate(180deg)' : 'rotate(0)' }}>{'\u25BC'}</span>
+                    <span className="hint-xs" style={{ transition: 'transform 0.2s', transform: historyOpen ? 'rotate(180deg)' : 'rotate(0)' }}><ChevronDown size={12} /></span>
                   </div>
                   {historyOpen && (
                     <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 300, overflowY: 'auto', marginTop: 8 }}>
@@ -1721,7 +1875,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                             <div style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--green)', flexShrink: 0 }} />
                             <div style={{ flex: 1, minWidth: 0 }}>
                               <div style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.title || fname}</div>
-                              <div style={{ color: 'var(--text3)', fontSize: 11, marginTop: 2 }}>
+                              <div className="hint" style={{ marginTop: 2 }}>
                                 {c.duration}s {'\u00B7'} {c.file_size_mb?.toFixed(1)}MB {'\u00B7'} {c.caption_style} {'\u00B7'} {timeStr}
                               </div>
                             </div>
@@ -1826,7 +1980,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
           </div>
 
           {/* Clip Edit Modal */}
-          {editingClip !== null && suggestions[editingClip] && (
+          {editingClip !== null && suggestions[editingClip] && createPortal(
             <div className="clip-edit-overlay" onClick={() => setEditingClip(null)}>
               <div className="clip-edit-panel" onClick={e => e.stopPropagation()}>
                 <h3>Edit clip #{editingClip + 1}</h3>
@@ -1841,16 +1995,16 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                     <div>
                       <input type="number" step="0.5" value={editForm.start} onChange={e => setEditForm(f => ({ ...f, start: parseFloat(e.target.value) || 0 }))}
                         style={{ textAlign: 'center' }} />
-                      <div style={{ fontSize: 10, color: 'var(--text3)', textAlign: 'center', marginTop: 2 }}>{fmt(editForm.start)}</div>
+                      <div className="hint-xs" style={{ textAlign: 'center', marginTop: 2 }}>{fmt(editForm.start)}</div>
                     </div>
-                    <div className="arrow">{'\u2192'}</div>
+                    <div className="arrow"><ArrowRight size={14} /></div>
                     <div>
                       <input type="number" step="0.5" value={editForm.end} onChange={e => setEditForm(f => ({ ...f, end: parseFloat(e.target.value) || 0 }))}
                         style={{ textAlign: 'center' }} />
-                      <div style={{ fontSize: 10, color: 'var(--text3)', textAlign: 'center', marginTop: 2 }}>{fmt(editForm.end)}</div>
+                      <div className="hint-xs" style={{ textAlign: 'center', marginTop: 2 }}>{fmt(editForm.end)}</div>
                     </div>
                   </div>
-                  <div style={{ fontSize: 11, color: 'var(--text3)', marginTop: 6, textAlign: 'center' }}>
+                  <div className="hint" style={{ marginTop: 6, textAlign: 'center' }}>
                     Duration: {Math.round(editForm.end - editForm.start)}s
                   </div>
                 </div>
@@ -1861,10 +2015,10 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                 </div>
               </div>
             </div>
-          )}
+          , document.body)}
 
           {/* Modal (mobile fallback) */}
-          {previewFile && (
+          {previewFile && createPortal(
             <div className="modal-overlay" onClick={() => setPreviewFile(null)}>
               <div className="modal-body" onClick={e => e.stopPropagation()}>
                 <video src={`/api/preview/${previewFile}`} controls autoPlay />
@@ -1873,7 +2027,7 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
                 </div>
               </div>
             </div>
-          )}
+          , document.body)}
         </div>
       );
     }

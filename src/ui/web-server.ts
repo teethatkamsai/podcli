@@ -24,6 +24,8 @@ import { mkdir, readdir, unlink } from "fs/promises";
 import path from "path";
 import { join, dirname, basename, extname, resolve } from "path";
 import { execSync, spawn } from "child_process";
+import { lookup } from "dns/promises";
+import { isIP } from "net";
 import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
@@ -43,6 +45,7 @@ import type {
   BatchClipsResult,
   ClipHistoryEntry,
   ClipResult,
+  Format,
   ProgressEvent,
   SuggestedClip,
   TranscriptResult,
@@ -81,7 +84,7 @@ function safePath(base: string, filename: string): string | null {
 // Track active jobs so the UI can poll progress
 interface JobState {
   id: string;
-  type: "transcribe" | "create_clip" | "batch_clips";
+  type: "transcribe" | "create_clip" | "batch_clips" | "download_video";
   status: "pending" | "running" | "done" | "error";
   progress: number;
   message: string;
@@ -110,10 +113,13 @@ interface UIState {
   settings: {
     captionStyle: string;
     cropStrategy: string;
+    format: string;
     logoPath: string;
     outroPath: string;
   };
   phase: string;
+  results: unknown[];
+  energyData: Record<string, unknown>;
   lastUpdated: number;
 }
 
@@ -140,6 +146,7 @@ function loadPersistedState(): UIState {
         settings: {
           captionStyle: saved.settings?.captionStyle || "branded",
           cropStrategy: saved.settings?.cropStrategy || "speaker",
+          format: saved.settings?.format || "vertical",
           logoPath: saved.settings?.logoPath || "",
           outroPath: saved.settings?.outroPath || "",
         },
@@ -147,6 +154,10 @@ function loadPersistedState(): UIState {
         phase: ["exporting", "parsing", "suggesting"].includes(saved.phase)
           ? "idle"
           : saved.phase || "idle",
+        results: ["exporting", "parsing", "suggesting"].includes(saved.phase)
+          ? []
+          : saved.results || [],
+        energyData: saved.energyData || {},
         lastUpdated: saved.lastUpdated || 0,
       };
     }
@@ -166,10 +177,13 @@ function loadPersistedState(): UIState {
     settings: {
       captionStyle: "branded",
       cropStrategy: "speaker",
+      format: "vertical",
       logoPath: "",
       outroPath: "",
     },
     phase: "idle",
+    results: [],
+    energyData: {},
     lastUpdated: 0,
   };
 }
@@ -263,6 +277,7 @@ function createBatchHistoryRecorder({
   transcriptWords,
   defaultCaptionStyle,
   defaultCropStrategy,
+  defaultFormat,
   label,
 }: {
   jobId: string;
@@ -270,6 +285,7 @@ function createBatchHistoryRecorder({
   transcriptWords: WordTimestamp[];
   defaultCaptionStyle?: string;
   defaultCropStrategy?: string;
+  defaultFormat?: Format;
   label: string;
 }) {
   const recordedClipIndexes = new Set<number>();
@@ -281,6 +297,7 @@ function createBatchHistoryRecorder({
       transcriptWords,
       defaultCaptionStyle,
       defaultCropStrategy,
+      defaultFormat,
       contentTypeFor: (s, e) => findContentType(uiState.suggestions, s, e),
     });
     for (const row of rows) {
@@ -360,7 +377,117 @@ const upload = multer({
   },
 });
 
+function clearEpisodeSessionState(): void {
+  sessionTranscripts.clear();
+  allowedSourcePaths.clear();
+  uiState.videoPath = "";
+  uiState.filePath = "";
+  uiState.activeExportJobId = null;
+  uiState.transcript = null;
+  uiState.rawTranscriptText = "";
+  uiState.suggestions = [];
+  uiState.deselectedIndices = [];
+  uiState.phase = "idle";
+  uiState.results = [];
+  uiState.energyData = {};
+  uiState.lastUpdated = Date.now();
+}
+
+function activeBlockingJobs(): JobState[] {
+  return [...jobs.values()].filter(
+    (job) =>
+      job.status === "running" &&
+      ["transcribe", "create_clip", "batch_clips"].includes(job.type),
+  );
+}
+
+function isPublicIp(address: string): boolean {
+  const family = isIP(address);
+  const mapped = address.toLowerCase().startsWith("::ffff:") ? address.slice(7) : "";
+  if (mapped) {
+    if (isIP(mapped) === 4) return isPublicIp(mapped);
+    const parts = mapped.split(":").map((part) => Number.parseInt(part, 16));
+    if (parts.length === 2 && parts.every((part) => Number.isFinite(part))) {
+      return isPublicIp([
+        parts[0] >> 8,
+        parts[0] & 255,
+        parts[1] >> 8,
+        parts[1] & 255,
+      ].join("."));
+    }
+  }
+  if (family === 4) {
+    const parts = address.split(".").map((part) => Number(part));
+    const [a, b] = parts;
+    return !(
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224
+    );
+  }
+  if (family === 6) {
+    const normalized = address.toLowerCase();
+    return !(
+      normalized === "::1" ||
+      normalized === "::" ||
+      normalized.startsWith("fc") ||
+      normalized.startsWith("fd") ||
+      normalized.startsWith("fe80:")
+    );
+  }
+  return false;
+}
+
+async function validateDownloadUrl(rawUrl: unknown): Promise<string> {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) {
+    throw new Error("url is required");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    throw new Error(`Invalid URL: ${rawUrl}`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`Unsupported URL protocol: ${parsed.protocol}. Use http or https.`);
+  }
+  // Best-effort SSRF preflight: yt-dlp still resolves redirects itself at download time.
+  const addresses = await lookup(parsed.hostname, { all: true, verbatim: false });
+  if (addresses.length === 0 || addresses.some((entry) => !isPublicIp(entry.address))) {
+    throw new Error(`Download URL host is not allowed: ${parsed.hostname}. Use a public video URL.`);
+  }
+  return parsed.toString();
+}
+
 // --- API Routes ---
+
+/**
+ * POST /api/session-cache/clear - Clear in-memory UI state.
+ */
+app.post("/api/session-cache/clear", async (_req, res) => {
+  try {
+    const active = activeBlockingJobs();
+    if (active.length > 0) {
+      res.status(409).json({
+        error: "Cannot clear session cache while jobs are running",
+        jobs: active.map((job) => ({ id: job.id, type: job.type, status: job.status })),
+      });
+      return;
+    }
+    clearEpisodeSessionState();
+    persistState();
+    broadcastSSE("state-sync", uiState);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: `Failed to clear session cache: ${errMsg(err)}` });
+  }
+});
 
 /**
  * POST /api/upload — Upload a podcast file
@@ -376,6 +503,157 @@ app.post("/api/upload", upload.single("file"), (req, res) => {
     filename: req.file.originalname,
     size_mb: Math.round((req.file.size / (1024 * 1024)) * 100) / 100,
   });
+});
+
+/**
+ * POST /api/download-video — Download a video URL with yt-dlp into uploads.
+ */
+app.post("/api/download-video", async (req, res) => {
+  let url: string;
+  try {
+    url = await validateDownloadUrl(req.body?.url);
+  } catch (err) {
+    res.status(400).json({ error: errMsg(err) });
+    return;
+  }
+
+  try {
+    await mkdir(uploadDir, { recursive: true });
+  } catch (err) {
+    res.status(500).json({ error: `Failed to create upload directory: ${errMsg(err)}` });
+    return;
+  }
+
+  const jobId = uuidv4();
+  const job: JobState = {
+    id: jobId,
+    type: "download_video",
+    status: "running",
+    progress: 0,
+    message: "Downloading video",
+    createdAt: Date.now(),
+  };
+  jobs.set(jobId, job);
+
+  const args = [
+    "-m",
+    "yt_dlp",
+    // Node is enabled only as a local JS runtime; remote EJS components stay disabled.
+    "--js-runtimes",
+    `node:${process.execPath}`,
+    "--no-playlist",
+    "--format",
+    "b[ext=mp4]/b",
+    "--restrict-filenames",
+    "--windows-filenames",
+    "--paths",
+    uploadDir,
+    "--output",
+    "%(title).200B [%(id)s].%(ext)s",
+    "--newline",
+    "--progress",
+    "--progress-template",
+    "download:podcli-progress:%(progress._percent_str)s",
+    "--print",
+    "after_move:podcli-filepath:%(filepath)s",
+    url,
+  ];
+  const proc = spawn(paths.pythonPath, args, {
+    env: { ...process.env, PYTHONUNBUFFERED: "1" },
+  });
+
+  let stdout = "";
+  let stderr = "";
+  let outputFilePath = "";
+  let settled = false;
+  let responded = false;
+  const timer = setTimeout(() => proc.kill("SIGTERM"), 3600_000);
+  const finish = (action: () => void): void => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    action();
+  };
+
+  const readYtDlpOutput = (raw: string): void => {
+    for (const line of raw.split(/\r?\n/)) {
+      const progress = line.match(/podcli-progress:\s*(\d+(?:\.\d+)?)%/);
+      if (progress) {
+        job.progress = Number(progress[1]);
+        job.message = "Downloading video";
+        broadcastSSE("job-update", { jobId, progress: job.progress, message: job.message });
+        continue;
+      }
+      const trimmed = line.trim();
+      if (trimmed.startsWith("podcli-filepath:")) {
+        outputFilePath = trimmed.slice("podcli-filepath:".length);
+      }
+    }
+  };
+
+  proc.stdout.on("data", (chunk: Buffer) => {
+    const raw = chunk.toString();
+    stdout += raw;
+    readYtDlpOutput(raw);
+  });
+  proc.stderr.on("data", (chunk: Buffer) => {
+    const raw = chunk.toString();
+    stderr += raw;
+    readYtDlpOutput(raw);
+    if (stderr && job.progress === 0) {
+      job.message = "Downloading video";
+    }
+  });
+  proc.on("error", (err) => {
+    finish(() => {
+      job.status = "error";
+      job.error = `Failed to start yt-dlp with ${paths.pythonPath}: ${err.message}`;
+      job.message = job.error;
+      broadcastSSE("job-error", { jobId, error: job.error });
+    });
+  });
+  proc.on("close", (code) => {
+    finish(() => {
+      if (code !== 0) {
+        job.status = "error";
+        job.error = `yt-dlp failed for ${url} with exit code ${code}. stderr: ${stderr.slice(-1200)}`;
+        job.message = job.error;
+        broadcastSSE("job-error", { jobId, error: job.error });
+        return;
+      }
+
+      const filePath = outputFilePath;
+      if (!filePath || !existsSync(filePath)) {
+        job.status = "error";
+        job.error = `yt-dlp finished but did not report an output file. stdout: ${stdout.slice(-1200)} stderr: ${stderr.slice(-1200)}`;
+        job.message = job.error;
+        broadcastSSE("job-error", { jobId, error: job.error });
+        return;
+      }
+
+      const stat = statSync(filePath);
+      registerSourcePath(filePath);
+      uiState.videoPath = filePath;
+      uiState.filePath = filePath;
+      uiState.lastUpdated = Date.now();
+      persistState();
+      broadcastSSE("state-sync", uiState);
+      job.status = "done";
+      job.progress = 100;
+      job.message = "Download complete";
+      job.result = {
+        file_path: filePath,
+        filename: basename(filePath),
+        size_mb: Math.round((stat.size / (1024 * 1024)) * 100) / 100,
+      };
+      broadcastSSE("job-complete", { jobId, result: job.result });
+    });
+  });
+  req.on("close", () => {
+    if (!responded && !settled) proc.kill("SIGTERM");
+  });
+  responded = true;
+  res.json({ job_id: jobId, status: "running" });
 });
 
 /**
@@ -547,6 +825,8 @@ app.post("/api/transcribe", async (req, res) => {
   const {
     file_path,
     model_size = "base",
+    engine,
+    assemblyai_api_key,
     language,
     enable_diarization = false,
     num_speakers,
@@ -556,12 +836,17 @@ app.post("/api/transcribe", async (req, res) => {
     res.status(400).json({ error: "File not found" });
     return;
   }
-
   // Check cache first
-  const cached = await cache.get(file_path);
+  const cached = await cache.get(file_path, engine);
   if (cached) {
     const jobId = uuidv4();
     sessionTranscripts.set(file_path, cached as unknown as ServerTranscript);
+    uiState.transcript = cached as unknown as typeof uiState.transcript;
+    uiState.videoPath = file_path;
+    uiState.filePath = file_path;
+    registerSourcePath(file_path);
+    uiState.lastUpdated = Date.now();
+    persistState();
     res.json({
       job_id: jobId,
       status: "done",
@@ -588,7 +873,7 @@ app.post("/api/transcribe", async (req, res) => {
   executor
     .execute(
       "transcribe",
-      { file_path, model_size, language, enable_diarization, num_speakers },
+      { file_path, model_size, engine, assemblyai_api_key, language, enable_diarization, num_speakers },
       (event) => {
         job.progress = event.percent;
         job.message = event.message;
@@ -613,7 +898,7 @@ app.post("/api/transcribe", async (req, res) => {
       persistState();
       // Cache it
       try {
-        await cache.set(file_path, result.data as unknown as TranscriptResult);
+        await cache.set(file_path, result.data as unknown as TranscriptResult, engine);
       } catch (err) {
         log.warn("Failed to cache transcript", { file_path, err: errMsg(err) });
       }
@@ -635,6 +920,7 @@ app.post("/api/create-clip", async (req, res) => {
     end_second,
     caption_style = "hormozi",
     crop_strategy = "speaker",
+    format = "vertical",
     transcript_words = [],
     title = "clip",
     logo_path = null,
@@ -663,9 +949,10 @@ app.post("/api/create-clip", async (req, res) => {
     return;
   }
   const duration = end_second - start_second;
-  if (duration > 180) {
+  const maxDur = format === "horizontal" ? 300 : 180;
+  if (duration > maxDur) {
     res.status(400).json({
-      error: `Clip too long (${Math.round(duration)}s). Max 180 seconds.`,
+      error: `Clip too long (${Math.round(duration)}s). Max ${maxDur} seconds.`,
     });
     return;
   }
@@ -689,6 +976,13 @@ app.post("/api/create-clip", async (req, res) => {
     res
       .status(400)
       .json({ error: `Invalid crop strategy. Use: ${validCrops.join(", ")}` });
+    return;
+  }
+  const validFormats = ["vertical", "horizontal", "square"];
+  if (!validFormats.includes(format)) {
+    res
+      .status(400)
+      .json({ error: `Invalid format. Use: ${validFormats.join(", ")}` });
     return;
   }
 
@@ -716,6 +1010,7 @@ app.post("/api/create-clip", async (req, res) => {
         end_second,
         caption_style,
         crop_strategy,
+        format,
         transcript_words,
         title,
         output_dir: paths.output,
@@ -743,6 +1038,7 @@ app.post("/api/create-clip", async (req, res) => {
           end_second,
           caption_style,
           crop_strategy,
+          format,
           logo_path: logo_path || undefined,
           outro_path: outro_path || undefined,
           title,
@@ -755,7 +1051,7 @@ app.post("/api/create-clip", async (req, res) => {
         const clipWords = sliceWords(transcript_words, start_second, end_second);
         await clipsHistory.saveWords(rec.id, clipWords);
         await clipsHistory.saveRecipe(rec.id, {
-          caption_style, crop_strategy, logo_path: logo_path || null, outro_path: outro_path || null,
+          caption_style, crop_strategy, format, logo_path: logo_path || null, outro_path: outro_path || null,
           clean_fillers, transcript_words: clipWords,
         });
         broadcastHistoryUpdated(jobId, [rec]);
@@ -805,9 +1101,14 @@ app.post("/api/batch-clips", async (req, res) => {
       res.status(400).json({ error: `Clip ${i + 1}: end must be after start` });
       return;
     }
-    if (dur > 180) {
+    if (c.format && !["vertical", "horizontal", "square"].includes(c.format)) {
+      res.status(400).json({ error: `Clip ${i + 1}: invalid format "${c.format}". Use: vertical, horizontal, square` });
+      return;
+    }
+    const maxDur = c.format === "horizontal" ? 300 : 180;
+    if (dur > maxDur) {
       res.status(400).json({
-        error: `Clip ${i + 1}: too long (${Math.round(dur)}s). Max 180s.`,
+        error: `Clip ${i + 1}: too long (${Math.round(dur)}s). Max ${maxDur}s.`,
       });
       return;
     }
@@ -1260,6 +1561,44 @@ app.post("/api/analyze-energy", async (req, res) => {
   }
 });
 
+// --- Highlight reel: detect once, then iterate on moments ---
+app.post("/api/reel", async (req, res) => {
+  try {
+    const result = await executor.execute("manage_reel", req.body || {});
+    const data = (result.data || {}) as any;
+    if (typeof data.source === "string") registerSourcePath(data.source);
+    if (typeof data.reel_path === "string") registerSourcePath(data.reel_path);
+    if (Array.isArray(data.moments)) {
+      for (const m of data.moments) {
+        if (m && typeof m.clip_path === "string" && m.clip_exists) registerSourcePath(m.clip_path);
+      }
+    }
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/reel-download", (req, res) => {
+  const filePath = req.query.path as string;
+  if (!filePath) {
+    res.status(400).json({ error: "path required" });
+    return;
+  }
+  let resolved: string;
+  try {
+    resolved = realpathSync(path.resolve(filePath));
+  } catch {
+    res.status(404).json({ error: "File not found" });
+    return;
+  }
+  if (extname(resolved).toLowerCase() !== ".mp4" || !allowedSourcePaths.has(resolved)) {
+    res.status(403).json({ error: "Access denied" });
+    return;
+  }
+  res.download(resolved);
+});
+
 // --- Encoder info ---
 app.get("/api/encoder-info", async (_req, res) => {
   try {
@@ -1627,6 +1966,19 @@ app.post("/api/settings", async (req, res) => {
     const action = value.trim() ? "set" : "unset";
     const result = await executor.execute("manage_env", { action, key, value });
     res.json(result.data ?? { ok: true });
+  } catch (err: unknown) {
+    res.status(500).json({ error: errMsg(err) });
+  }
+});
+
+app.get("/api/ai-cli-status", async (_req, res) => {
+  try {
+    const result = await executor.execute<{
+      configured?: Record<string, string | null>;
+      candidates?: Array<{ engine: string; path: string }>;
+      available?: boolean;
+    }>("ai_cli_status", {});
+    res.json(result.data ?? { available: false, candidates: [], configured: {} });
   } catch (err: unknown) {
     res.status(500).json({ error: errMsg(err) });
   }
@@ -2523,6 +2875,44 @@ app.post("/api/content-studio/generate", async (req, res) => {
   }
 });
 
+/**
+ * POST /api/content-studio/custom — free-form or per-section content request.
+ */
+app.post("/api/content-studio/custom", async (req, res) => {
+  const { instruction, transcript_text, mode } = req.body || {};
+  if (!instruction || !String(instruction).trim()) {
+    res.status(400).json({ error: "instruction is required" });
+    return;
+  }
+  let segs: Array<{ start: number; text: string }>;
+  if (typeof transcript_text === "string" && transcript_text.trim()) {
+    segs = packTranscriptText(transcript_text);
+  } else if (uiState.transcript?.segments?.length) {
+    segs = condenseSegments(uiState.transcript.segments);
+  } else {
+    res.status(400).json({ error: "paste a transcript or load an episode first" });
+    return;
+  }
+  try {
+    const result = await executor.execute(
+      "generate_custom",
+      {
+        instruction: String(instruction),
+        transcript_segments: segs,
+        mode: mode === "episode" ? "episode" : "shorts",
+      },
+      (event) => {
+        broadcastSSE("job-update", { progress: event.percent, message: event.message });
+      },
+    );
+    res.json(result.data || {});
+  } catch (err: any) {
+    res.status(500).json({
+      error: `Custom generation failed: ${err.message?.substring(0, 200)}`,
+    });
+  }
+});
+
 // --- MCP ↔ UI Bridge Endpoints ---
 
 /**
@@ -2600,11 +2990,15 @@ app.post("/api/ui-state", (req, res) => {
   if (body.deselectedIndices !== undefined)
     uiState.deselectedIndices = body.deselectedIndices;
   if (body.phase !== undefined) uiState.phase = body.phase;
+  if (body.results !== undefined) uiState.results = body.results;
+  if (body.energyData !== undefined) uiState.energyData = body.energyData;
   if (body.settings) {
     if (body.settings.captionStyle !== undefined)
       uiState.settings.captionStyle = body.settings.captionStyle;
     if (body.settings.cropStrategy !== undefined)
       uiState.settings.cropStrategy = body.settings.cropStrategy;
+    if (body.settings.format !== undefined)
+      uiState.settings.format = body.settings.format;
     if (body.settings.logoPath !== undefined)
       uiState.settings.logoPath = body.settings.logoPath;
     if (body.settings.outroPath !== undefined)
@@ -2654,6 +3048,8 @@ app.post("/api/mcp/export", async (req, res) => {
     req.body.caption_style || uiState.settings.captionStyle || "branded";
   const cropStrategy =
     req.body.crop_strategy || uiState.settings.cropStrategy || "speaker";
+  const format =
+    req.body.format || uiState.settings.format || "vertical";
   const allowAssFallback = req.body.allow_ass_fallback === true;
 
   if (!videoPath || !existsSync(videoPath)) {
@@ -2674,6 +3070,7 @@ app.post("/api/mcp/export", async (req, res) => {
     title: (c.title || "clip").slice(0, 40),
     caption_style: c.caption_style || captionStyle,
     crop_strategy: c.crop_strategy || cropStrategy,
+    format: c.format || format,
     allow_ass_fallback: c.allow_ass_fallback === true || allowAssFallback,
     // Preserve multi-cut segments from suggestions
     ...(Array.isArray(c.segments) &&
@@ -2697,6 +3094,7 @@ app.post("/api/mcp/export", async (req, res) => {
     transcriptWords,
     defaultCaptionStyle: captionStyle,
     defaultCropStrategy: cropStrategy,
+    defaultFormat: format,
     label: "MCP export",
   });
 

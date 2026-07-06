@@ -18,6 +18,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from version import VERSION
 
 # Windows stdout/stderr default to cp1252, which can't encode chars like '→'; output is UTF-8.
 for _stream in (sys.stdout, sys.stderr):
@@ -82,6 +83,7 @@ def _selection_signature(config: dict) -> str:
         bool(config.get("ai_select", True)),
         config.get("min_clip_duration", MIN_CLIP_DURATION),
         config.get("max_clip_duration", MAX_CLIP_DURATION),
+        config.get("format", "vertical"),
     ))
 
 
@@ -359,6 +361,11 @@ def cmd_studio(args):
         cmd += ["--paragraph", args.paragraph]
     if args.language:
         cmd += ["--language", args.language]
+    if getattr(args, "engine", None):
+        cmd += ["--engine", args.engine]
+    env = os.environ.copy()
+    if getattr(args, "assemblyai_api_key", None):
+        env["ASSEMBLYAI_API_KEY"] = args.assemblyai_api_key
     cmd += [
         "--caption-style", args.caption_style,
         "--crop", args.crop,
@@ -385,8 +392,67 @@ def cmd_studio(args):
         cmd += ["--no-outro"]
 
     import subprocess
-    rc = subprocess.run(cmd).returncode
+    rc = subprocess.run(cmd, env=env).returncode
     sys.exit(rc)
+
+
+def cmd_reel(args):
+    """Create and iterate on a highlights reel — detect once, then edit moments fast."""
+    from services.reel import (
+        ReelSession, seed_session, edit_moment, build_reel, list_sessions, delete_session,
+    )
+    from services.transcript_packer import compute_cache_hash, load_cached_transcript_for_video
+
+    def _mmss(s):
+        return f"{int(s // 60)}:{int(s % 60):02d}"
+
+    def _show(session):
+        for i, m in enumerate(session.moments, 1):
+            flag = "" if m.enabled else "  (disabled)"
+            print(f"  [{i}] {_mmss(m.start)}-{_mmss(m.end)} ({m.duration:.0f}s, {m.why}){flag}")
+            if m.text:
+                print("      " + (m.text[:150] + "…" if len(m.text) > 150 else m.text))
+
+    action = getattr(args, "reel_action", None)
+    if action == "new":
+        video = _clean_path(args.video)
+        sid = compute_cache_hash(video)
+        out_dir = args.output or os.path.join(os.getcwd(), f"reel_{sid[:8]}")
+        cached = load_cached_transcript_for_video(video)
+        words = cached.get("words") if cached else None
+        print("  Detecting moments (one-time)...")
+        session = seed_session(
+            sid, video, out_dir, profile=args.profile or "auto",
+            format=args.format or "horizontal", top_n=args.top or 10,
+            min_dur=args.min_dur, max_dur=args.max_dur,
+            words=words, progress_callback=lambda p, m: print(f"    {m}") if m else None,
+        )
+        _show(session)
+        print("  Building reel...")
+        reel = build_reel(session)
+        print(f"  ✓ {reel}")
+        print(f"  session: {sid}")
+        print(f"  edit with: podcli reel edit {sid} <N> <longer|shorter|earlier|later|shift|drop|toggle> [secs]")
+    elif action == "list":
+        for s in list_sessions():
+            print(f"  {s['session_id']}  {s['profile']}/{s['format']}  "
+                  f"{s['enabled_count']}/{s['moment_count']} moments  {os.path.basename(s['source'])}")
+    elif action == "delete":
+        ok = delete_session(args.session)
+        print(f"  {'✓ deleted' if ok else '✗ no such session'} {args.session}")
+    elif action == "show":
+        _show(ReelSession.load(args.session))
+    elif action == "edit":
+        session = edit_moment(ReelSession.load(args.session), args.index, args.op, args.seconds)
+        reel = build_reel(session)
+        print(f"  ✓ rebuilt {reel}")
+        _show(session)
+    elif action == "build":
+        reel = build_reel(ReelSession.load(args.session))
+        print(f"  ✓ {reel}")
+    else:
+        print("  Usage: podcli reel new <video> | list | show <session> | "
+              "edit <session> N <op> [secs] | build <session> | delete <session>")
 
 
 def cmd_process(args):
@@ -394,6 +460,7 @@ def cmd_process(args):
     from services.clip_generator import generate_clip
     from services.transcript_parser import parse_speaker_transcript
     from services.audio_analyzer import get_energy_profile
+    from services.audio_events import get_event_profile, is_available as audio_events_available
     from services.encoder import get_encoder_info
     from presets import get_preset, DEFAULT_PRESET, MIN_CLIP_DURATION, MAX_CLIP_DURATION, TARGET_CLIP_DURATION_MIN, TARGET_CLIP_DURATION_MAX
 
@@ -436,10 +503,18 @@ def cmd_process(args):
     # CLI overrides
     if getattr(args, "engine", None):
         os.environ["PODCLI_ENGINE"] = args.engine
+    if getattr(args, "assemblyai_api_key", None):
+        os.environ["ASSEMBLYAI_API_KEY"] = args.assemblyai_api_key
     if args.caption_style:
         config["caption_style"] = args.caption_style
     if args.crop:
         config["crop_strategy"] = args.crop
+    if getattr(args, "format", None):
+        config["format"] = args.format
+    if getattr(args, "profile", None):
+        config["profile"] = args.profile
+    if getattr(args, "thumbnails", None) is not None:
+        config["generate_thumbnails"] = args.thumbnails
     if args.top:
         config["top_clips"] = args.top
     if getattr(args, "review_each", False):
@@ -454,7 +529,9 @@ def cmd_process(args):
         else:
             print(f"  Warning: Logo '{args.logo}' not found (checked assets and filesystem)", file=sys.stderr)
             config["logo_path"] = args.logo  # pass through anyway
-    if args.outro:
+    if getattr(args, "no_outro", False):
+        config["outro_path"] = ""
+    elif args.outro:
         from services.asset_store import resolve as resolve_asset_outro
         resolved = resolve_asset_outro(args.outro)
         if resolved:
@@ -463,10 +540,14 @@ def cmd_process(args):
             print(f"  Warning: Outro '{args.outro}' not found (checked assets and filesystem)", file=sys.stderr)
             config["outro_path"] = args.outro
     elif not config.get("outro_path"):
-        from services.asset_store import default_outro
-        auto_outro = default_outro()
-        if auto_outro:
-            config["outro_path"] = auto_outro
+        # Highlight profiles (party/action) are raw moments, not branded shorts, so they
+        # skip the auto-outro; the podcast flow keeps it.
+        from services.profiles import get_profile as _get_profile
+        if _get_profile(config.get("profile")).candidate_source != "saliency":
+            from services.asset_store import default_outro
+            auto_outro = default_outro()
+            if auto_outro:
+                config["outro_path"] = auto_outro
     if args.time_adjust is not None:
         config["time_adjust"] = args.time_adjust
     if args.no_energy:
@@ -540,10 +621,30 @@ def cmd_process(args):
     segments = []
     result = {}
 
+    # Saliency profiles (party/action) select on audio/visual signals, not dialogue,
+    # so transcribing a long video would be wasted work — skip it entirely.
+    from services.profiles import get_profile
+
+    content_profile = get_profile(config.get("profile"))
+    skip_transcript = content_profile.candidate_source == "saliency" and not args.transcript
+
     from services.transcript_packer import (
         load_cached_transcript_for_video,
         save_cached_transcript_for_video,
     )
+
+    if skip_transcript:
+        # Reuse an existing transcript so highlight boundaries snap to whole sentences;
+        # only skip transcription outright when there is none (true no-dialogue footage).
+        cached = load_cached_transcript_for_video(video_path)
+        if cached and not config.get("no_cache", False):
+            words = cached["words"]
+            segments = cached["segments"]
+            result = cached
+            skip_transcript = False
+            print(f"  [1/4] Reusing cached transcript ({len(segments)} segments) for sentence-clean cuts")
+        else:
+            print(f"  [1/4] Skipping transcription ({content_profile.name} profile uses audio/visual signals)")
 
     if args.transcript:
         print("  [1/4] Loading transcript...")
@@ -570,7 +671,7 @@ def cmd_process(args):
             words = parsed["words"]
             segments = parsed["segments"]
             print(f"         Parsed: {len(segments)} segments, {len(words)} words")
-    else:
+    elif not skip_transcript:
         # Check cache first
         cached = load_cached_transcript_for_video(video_path)
         if cached and not config.get("no_cache", False):
@@ -580,7 +681,9 @@ def cmd_process(args):
             result = cached
             print(f"         {len(segments)} segments, {len(words)} words")
         else:
-            print("  [1/4] Transcribing with Whisper...")
+            from services.engines import is_assemblyai_engine
+            engine_label = "AssemblyAI" if is_assemblyai_engine(os.environ.get("PODCLI_ENGINE", "")) else "Whisper"
+            print(f"  [1/4] Transcribing with {engine_label}...")
             _ensure_ssl_certs()
             import warnings
             warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
@@ -610,6 +713,7 @@ def cmd_process(args):
                 result = transcribe_file(
                     file_path=video_path,
                     model_size=config.get("whisper_model", "base"),
+                    engine=os.environ.get("PODCLI_ENGINE") or None,
                     enable_diarization=not config.get("no_speakers", False),
                     progress_callback=_transcribe_progress,
                 )
@@ -646,12 +750,13 @@ def cmd_process(args):
     else:
         print(f"         No speaker data (center crop fallback)")
 
-    if not segments:
+    if not segments and not skip_transcript:
         print("  Error: No transcript segments found.", file=sys.stderr)
         sys.exit(1)
 
     # ── Step 2: Analyze audio energy ──
     energy_scores = None
+    reaction_scores = None
     if config.get("energy_boost", True):
         print("  [2/4] Analyzing audio energy...")
         try:
@@ -660,6 +765,15 @@ def cmd_process(args):
             print(f"         {len(profile['peak_times'])} peak moments found")
         except Exception as e:
             print(f"         Skipped (error: {e})")
+        if audio_events_available():
+            try:
+                reactions = get_event_profile(video_path, segments)
+                reaction_scores = reactions["segment_scores"]
+                n = len(reactions["reaction_times"])
+                if n:
+                    print(f"         {n} laughter/reaction moments found")
+            except Exception as e:
+                print(f"         Reactions skipped (error: {e})")
     else:
         print("  [2/4] Audio analysis skipped (--no-energy)")
 
@@ -678,11 +792,37 @@ def cmd_process(args):
             clips = resumed
             resumed_from_session = True
 
+    # Saliency profiles (party/action) pick moments from the fused laughter/energy
+    # curve rather than the transcript, so they work on footage with no dialogue.
+    if content_profile.candidate_source == "saliency" and not clips:
+        from services.saliency import detect_highlights
+        from services.formats import get_format
+
+        spec = get_format(config.get("format", "vertical"))
+        print(f"  [3/4] Detecting {content_profile.name} highlights (laughter + energy)...")
+        clips = detect_highlights(
+            video_path,
+            profile_name=content_profile.name,
+            top_n=top_n,
+            min_dur=15.0,
+            max_dur=min(60.0, float(spec.dur_max)),
+            segments=segments or None,
+            words=words or None,
+            progress_callback=lambda pct, msg: print(f"         {msg}") if msg else None,
+        )
+        if clips:
+            print(f"         ✓ {len(clips)} highlights found")
+            _save_suggestions_session(cache_hash, top_n, "saliency", clips, selection_sig)
+        else:
+            print("         ⚠ No highlights found, falling back to transcript selection")
+
     # Try an AI CLI first (uses PodStack knowledge base for intelligent selection)
     from services.claude_suggest import suggest_initial_with_claude, _engine_label, _find_ai_cli
 
     ai_path, ai_engine = _find_ai_cli()
-    if not clips and ai_path and config.get("ai_select", True):
+    if clips:
+        pass  # already selected (resumed cache or saliency profile)
+    elif ai_path and config.get("ai_select", True):
         ai_label = _engine_label(ai_engine)
         print(f"  [3/4] Selecting moments with {ai_label} (PodStack)...")
         clips = suggest_initial_with_claude(
@@ -707,6 +847,7 @@ def cmd_process(args):
         clips = _suggest_clips(
             segments=segments,
             energy_scores=energy_scores,
+            reaction_scores=reaction_scores,
             top_n=top_n,
             min_dur=config.get("min_clip_duration", MIN_CLIP_DURATION),
             max_dur=config.get("max_clip_duration", MAX_CLIP_DURATION),
@@ -796,6 +937,7 @@ def cmd_process(args):
                         end_second=clip["end_second"],
                         caption_style=config.get("caption_style", "branded"),
                         crop_strategy=config.get("crop_strategy", "face"),
+                        format=config.get("format", "vertical"),
                         transcript_words=words,
                         title=clip.get("title", f"clip_{i+1}"),
                         output_dir=output_dir,
@@ -1008,6 +1150,7 @@ def cmd_process(args):
                                 end_second=clip["end_second"],
                                 caption_style=config.get("caption_style", "branded"),
                                 crop_strategy=config.get("crop_strategy", "face"),
+                                format=config.get("format", "vertical"),
                                 transcript_words=words,
                                 title=clip.get("title", f"clip_{i+1}"),
                                 output_dir=output_dir,
@@ -1331,6 +1474,7 @@ def _post_render_loop(
                     end_second=clip["end_second"],
                     caption_style=config.get("caption_style", "branded"),
                     crop_strategy=config.get("crop_strategy", "face"),
+                    format=config.get("format", "vertical"),
                     transcript_words=words,
                     title=clip.get("title", "clip"),
                     output_dir=output_dir,
@@ -1515,6 +1659,7 @@ def _post_render_loop(
                                         end_second=f_clip["end_second"],
                                         caption_style=config.get("caption_style", "branded"),
                                         crop_strategy=config.get("crop_strategy", "face"),
+                                        format=config.get("format", "vertical"),
                                         transcript_words=words,
                                         title=f_clip.get("title", "clip"),
                                         output_dir=output_dir,
@@ -1569,6 +1714,7 @@ def _post_render_loop(
                                         end_second=nc["end_second"],
                                         caption_style=config.get("caption_style", "branded"),
                                         crop_strategy=config.get("crop_strategy", "face"),
+                                        format=config.get("format", "vertical"),
                                         transcript_words=words,
                                         title=nc.get("title", "clip"),
                                         output_dir=output_dir,
@@ -1597,6 +1743,7 @@ def _post_render_loop(
 def _suggest_clips(
     segments: list,
     energy_scores: list | None = None,
+    reaction_scores: list | None = None,
     top_n: int = 5,
     min_dur: float = MIN_CLIP_DURATION,
     max_dur: float = MAX_CLIP_DURATION,
@@ -1793,6 +1940,15 @@ def _suggest_clips(
                     score += min(energy_score, 6)
                     if max_e > 7:
                         reasons.append("high_energy")
+
+            # ── 6b. Laughter / reactions (0-6 pts) ──
+            if reaction_scores:
+                seg_reactions = reaction_scores[snap_start : snap_end + 1]
+                if seg_reactions:
+                    max_r = max(seg_reactions)
+                    score += min(max_r, 6)
+                    if max_r > 3:
+                        reasons.append("laughter")
 
             # ── 7. Density check — penalize sparse/rambling segments ──
             words_per_sec = len(text.split()) / max(dur, 1)
@@ -2874,17 +3030,24 @@ def cmd_youtube(args):
 
 def cmd_env(args):
     """Manage secrets/settings in the global .env."""
+    from services.claude_suggest import get_ai_cli_status
     from services.env_settings import run_env_action
 
     accent = "\033[38;2;212;135;74m"
     green = "\033[38;2;74;222;128m"
     gray = "\033[38;5;245m"
+    yellow = "\033[38;2;250;204;21m"
     reset = "\033[0m"
     action = getattr(args, "env_action", None) or "list"
     try:
         if action == "set":
             run_env_action("set", args.key, args.value)
             print(f"  {green}✓{reset} {args.key} set")
+            if args.key in ("PODCLI_CLAUDE_PATH", "PODCLI_CODEX_PATH"):
+                status = get_ai_cli_status()
+                if status.get("available"):
+                    for c in status.get("candidates", []):
+                        print(f"  {gray}→{reset} {c['engine']}: {c['path']}")
         elif action == "unset":
             run_env_action("unset", args.key)
             print(f"  {green}✓{reset} {args.key} removed")
@@ -2892,11 +3055,22 @@ def cmd_env(args):
             data = run_env_action("list")
             print(f"\n  {gray}Settings ({data['path']}){reset}\n")
             for s in data["settings"]:
-                mark = f"{green}set{reset}" if s["set"] else f"{gray}not set{reset}"
+                mark = f"{green}set{reset}" if s["set"] else f"{gray}auto{reset}" if not s["secret"] else f"{gray}not set{reset}"
                 val = f" {gray}{s['preview']}{reset}" if s["set"] else ""
                 print(f"  {accent}{s['key']}{reset} — {s['label']}  [{mark}]{val}")
                 print(f"    {gray}{s['help']}{reset}")
-                print(f"    {gray}{s['url']}{reset}\n")
+                if s.get("url"):
+                    print(f"    {gray}{s['url']}{reset}")
+                print()
+            ai = data.get("ai_cli") or {}
+            if ai.get("available"):
+                print(f"  {green}AI CLI detected{reset}")
+                for c in ai.get("candidates", []):
+                    print(f"    {accent}{c['engine']}{reset}  {c['path']}")
+            else:
+                print(f"  {yellow}AI CLI not detected{reset}")
+                print(f"    {gray}Set a path:{reset} {accent}podcli env set PODCLI_CLAUDE_PATH ~/.local/bin/claude{reset}")
+            print()
     except ValueError as e:
         print(f"  ✗ {e}", file=sys.stderr)
         sys.exit(1)
@@ -3008,15 +3182,18 @@ def cmd_cache(args):
 def cmd_info(args):
     """Show system info."""
     from services.encoder import get_encoder_info
-    from services.claude_suggest import _find_ai_cli
+    from services.claude_suggest import get_ai_cli_status
 
     green = "\033[38;2;74;222;128m"
     yellow = "\033[38;2;250;204;21m"
     gray = "\033[38;5;245m"
+    accent = "\033[38;2;212;135;74m"
     reset = "\033[0m"
 
     info = get_encoder_info()
-    ai_path, ai_engine = _find_ai_cli()
+    ai = get_ai_cli_status()
+    candidates = ai.get("candidates") or []
+    configured = ai.get("configured") or {}
 
     # Check HF_TOKEN
     hf_token = os.environ.get("HF_TOKEN", "")
@@ -3048,12 +3225,21 @@ def cmd_info(args):
     else:
         speakers_status = f"{yellow}✗ set a token — run: podcli env set HF_TOKEN <token>"
 
-    print(f"    AI CLI:       {green}{('Claude' if ai_engine == 'claude' else 'Codex') + ' (' + ai_path + ')' if ai_path else f'{yellow}not found — install Claude Code or Codex'}{reset}")
+    if candidates:
+        c0 = candidates[0]
+        ai_line = f"{green}{('Claude' if c0['engine'] == 'claude' else 'Codex')} ({c0['path']}){reset}"
+    else:
+        ai_line = f"{yellow}not found{reset}"
+    print(f"    AI CLI:       {ai_line}")
+    for engine in ("claude", "codex"):
+        manual = configured.get(engine)
+        if manual:
+            print(f"    {engine} override: {accent}{manual}{reset}")
+    if not candidates:
+        print(f"    {gray}Override:{reset} {accent}podcli env set PODCLI_CLAUDE_PATH ~/.local/bin/claude{reset}")
     print(f"    Speakers:     {speakers_status}{reset}")
     print()
 
-
-VERSION = "1.0.0"
 
 BANNER = """
 \033[38;2;212;135;74m  ┌─────────────────────────────────────┐
@@ -3062,8 +3248,8 @@ BANNER = """
   │   ██╔══██╗██╔═══██╗██╔══██╗         │
   │   ██████╔╝██║   ██║██║  ██║         │
   │   ██╔═══╝ ██║   ██║██║  ██║         │
-  │   ██║     ╚██████╔╝██████╔╝\033[0m\033[1m CLI\033[0m\033[38;2;212;135;74m    │
-  │   ╚═╝      ╚═════╝ ╚═════╝         │
+  │   ██║     ╚██████╔╝██████╔╝\033[0m\033[1m CLI\033[0m\033[38;2;212;135;74m     │
+  │   ╚═╝      ╚═════╝ ╚═════╝          │
   │                                     │
   └─────────────────────────────────────┘\033[0m"""
 
@@ -3267,12 +3453,18 @@ def main():
     proc.add_argument("-n", "--top", type=int, help="Number of top clips to export (default: 5)")
     proc.add_argument("-o", "--output", help="Output directory (default: ./clips)")
     proc.add_argument("-p", "--preset", help="Load a saved preset")
-    proc.add_argument("--engine", choices=["whisper-py", "whispercpp"], help="Transcription engine (default: whisper-py; whispercpp is the native, PyTorch-free path)")
+    proc.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai"], help="Transcription engine (default: whisper-py; whispercpp is local; assemblyai uses ASSEMBLYAI_API_KEY)")
+    proc.add_argument("--assemblyai-api-key", help="AssemblyAI API key for --engine assemblyai. Prefer ASSEMBLYAI_API_KEY; command-line secrets can appear in process listings.")
     proc.add_argument("--fast", action="store_true", help="Draft mode: tiny Whisper, heuristic selection, center crop, low quality")
+    proc.add_argument("--thumbnails", dest="thumbnails", action="store_true", default=None, help="Force thumbnail generation on")
+    proc.add_argument("--no-thumbnails", dest="thumbnails", action="store_false", help="Skip thumbnail generation")
     proc.add_argument("--caption-style", choices=["branded", "hormozi", "karaoke", "subtle"])
     proc.add_argument("--crop", choices=["center", "face", "speaker", "speaker-hardcut"])
+    proc.add_argument("--format", choices=["vertical", "horizontal", "square"], help="Output aspect ratio (default: vertical)")
+    proc.add_argument("--profile", choices=["podcast", "party", "action"], help="Detection profile: podcast (transcript-first, default), party/action (laughter/energy highlights)")
     proc.add_argument("--logo", help="Logo image (asset name or path)")
     proc.add_argument("--outro", help="Outro video (asset name or path)")
+    proc.add_argument("--no-outro", action="store_true", help="Do not append an outro (default for highlight profiles)")
     proc.add_argument("--time-adjust", type=float, help="Timestamp offset in seconds")
     proc.add_argument("--no-energy", action="store_true", help="Skip audio energy analysis")
     proc.add_argument("--no-speakers", action="store_true", help="Skip speaker detection (faster, uses face detection only)")
@@ -3283,6 +3475,33 @@ def main():
     proc.add_argument("--review-each", action="store_true", help="Review each rendered clip interactively")
     proc.add_argument("--post-review", action="store_true", help="Open the post-render review loop after export")
 
+    # ── reel (highlights, detect once then iterate fast) ──
+    reel_p = sub.add_parser("reel", help="Create and iterate on a highlights reel")
+    reel_sub = reel_p.add_subparsers(dest="reel_action")
+    rn = reel_sub.add_parser("new", help="Detect moments and build a reel")
+    rn.add_argument("video", help="Path to the source video")
+    rn.add_argument("--profile", choices=["auto", "party", "action"], default="auto")
+    rn.add_argument("--format", choices=["vertical", "horizontal", "square"], default="horizontal",
+                    help="Reel aspect ratio (default horizontal 1920x1080)")
+    rn.add_argument("-n", "--top", type=int, help="Number of moments (default 10)")
+    rn.add_argument("--min-dur", type=float, default=15.0, dest="min_dur",
+                    help="Shortest moment in seconds (default 15)")
+    rn.add_argument("--max-dur", type=float, default=60.0, dest="max_dur",
+                    help="Longest moment in seconds (default 60)")
+    rn.add_argument("-o", "--output", help="Output directory")
+    reel_sub.add_parser("list", help="List saved reel sessions")
+    rdel = reel_sub.add_parser("delete", help="Delete a reel session")
+    rdel.add_argument("session")
+    rsh = reel_sub.add_parser("show", help="List the moments in a reel session")
+    rsh.add_argument("session", help="Session id (printed by 'reel new')")
+    red = reel_sub.add_parser("edit", help="Adjust one moment and rebuild")
+    red.add_argument("session")
+    red.add_argument("index", type=int, help="1-based moment number")
+    red.add_argument("op", choices=["longer", "shorter", "earlier", "later", "shift", "drop", "toggle"])
+    red.add_argument("seconds", type=float, nargs="?", default=0.0)
+    rbd = reel_sub.add_parser("build", help="Rebuild the reel (re-cuts only changed moments)")
+    rbd.add_argument("session")
+
     # ── studio ──
     studio = sub.add_parser("studio", help="Cut a fragment + add Remotion intro/outro (follow-us) bookends")
     studio.add_argument("video", nargs="?", default=None, help="Path to the source video (omit only with --save-brand)")
@@ -3290,6 +3509,8 @@ def main():
     studio.add_argument("--end", type=float, help="Fragment end (seconds)")
     studio.add_argument("--paragraph", help="Find the fragment by matching this text in the transcript")
     studio.add_argument("--language", help="Transcription language (e.g. es). Auto-detect if omitted.")
+    studio.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai"], help="Transcription engine")
+    studio.add_argument("--assemblyai-api-key", help="AssemblyAI API key for --engine assemblyai. Prefer ASSEMBLYAI_API_KEY; command-line secrets can appear in process listings.")
     studio.add_argument("--caption-style", choices=["hormozi", "karaoke", "subtle", "branded"], default="hormozi")
     studio.add_argument("--crop", choices=["center", "face", "speaker", "speaker-hardcut"], default="face")
     studio.add_argument("-o", "--output", help="Final output path")
@@ -3496,11 +3717,11 @@ def main():
     cfg_use.add_argument("home", help="Path to the config root to activate")
 
     # ── env (secrets / settings) ──
-    env_p = sub.add_parser("env", help="Manage secrets/settings stored in .env (e.g. HF_TOKEN)")
+    env_p = sub.add_parser("env", help="Manage .env settings (HF_TOKEN, PODCLI_CLAUDE_PATH, PODCLI_CODEX_PATH)")
     env_sub = env_p.add_subparsers(dest="env_action")
     env_sub.add_parser("list", help="Show known settings and whether they're set")
     env_set = env_sub.add_parser("set", help="Set a setting")
-    env_set.add_argument("key", help="Setting key, e.g. HF_TOKEN")
+    env_set.add_argument("key", help="Setting key, e.g. HF_TOKEN or PODCLI_CLAUDE_PATH")
     env_set.add_argument("value", help="Value")
     env_unset = env_sub.add_parser("unset", help="Remove a setting")
     env_unset.add_argument("key", help="Setting key, e.g. HF_TOKEN")
@@ -3538,6 +3759,8 @@ def main():
         cmd_process(args)
     elif args.command == "studio":
         cmd_studio(args)
+    elif args.command == "reel":
+        cmd_reel(args)
     elif args.command == "thumbnails":
         cmd_thumbnails(args)
     elif args.command == "thumbnail-config":

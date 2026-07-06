@@ -2,7 +2,7 @@
 
 export interface TaskRequest {
   task_id: string;
-  task_type: "transcribe" | "parse_transcript" | "create_clip" | "batch_clips" | "analyze_energy" | "pack_transcript" | "detect_encoder" | "presets" | "ping" | "suggest_clips" | "find_moment" | "generate_content" | "corrections" | "manage_integrations" | "run_integration_tool" | "manage_config" | "manage_env";
+  task_type: "transcribe" | "parse_transcript" | "create_clip" | "batch_clips" | "analyze_energy" | "detect_highlights" | "manage_reel" | "pack_transcript" | "detect_encoder" | "presets" | "ping" | "suggest_clips" | "find_moment" | "generate_content" | "generate_custom" | "corrections" | "manage_integrations" | "run_integration_tool" | "manage_config" | "manage_env" | "ai_cli_status";
   params: Record<string, unknown>;
 }
 
@@ -65,12 +65,14 @@ export interface TranscriptResult {
   language: string;
   speakers: SpeakerSummary;
   speaker_segments: SpeakerSegment[];
+  engine?: string;
 }
 
 // === Clip Models ===
 
 export type CaptionStyle = "branded" | "hormozi" | "karaoke" | "subtle";
 export type CropStrategy = "center" | "face" | "speaker";
+export type Format = "vertical" | "horizontal" | "square";
 
 export interface ClipRequest {
   video_path: string;
@@ -86,6 +88,7 @@ export interface ClipResult {
   output_path: string;
   duration: number;
   file_size_mb: number;
+  format?: Format;
   caption_overlay_path?: string;
   cropped_source_path?: string;
 }
@@ -116,6 +119,7 @@ export interface UIState {
   settings?: {
     captionStyle?: string;
     cropStrategy?: string;
+    format?: Format;
     logoPath?: string;
     outroPath?: string;
   };
@@ -131,6 +135,7 @@ export interface CreateClipInput {
   title?: string;
   caption_style?: string;
   crop_strategy?: string;
+  format?: Format;
   logo_path?: string;
   outro_path?: string;
   transcript_words?: WordTimestamp[];
@@ -145,6 +150,7 @@ export interface BatchClipSpec {
   title?: string;
   caption_style?: string;
   crop_strategy?: string;
+  format?: Format;
   logo_path?: string | null;
   allow_ass_fallback?: boolean;
   keep_caption_overlay?: boolean;
@@ -157,6 +163,7 @@ export interface BatchClipsInput {
   clip_numbers?: number[];
   clips?: BatchClipSpec[];
   export_selected?: boolean;
+  format?: Format;
   clean_fillers?: boolean;
   allow_ass_fallback?: boolean;
   keep_caption_overlay?: boolean;
@@ -179,6 +186,7 @@ export interface BatchClipsResult {
     end_second?: number;
     caption_style?: string;
     crop_strategy?: string;
+    format?: Format;
     title?: string;
     file_size_mb?: number;
     duration?: number;
@@ -227,6 +235,7 @@ export interface ClipHistoryEntry {
   end_second: number;
   caption_style: string;
   crop_strategy: string;
+  format?: Format;
   logo_path?: string;
   outro_path?: string;
   title: string;

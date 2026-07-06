@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect } from "react";
 import { NavLink, Link, Outlet } from "react-router-dom";
 import {
   LayoutGrid,
@@ -10,6 +10,7 @@ import {
   Plug,
   Terminal,
   BarChart3,
+  Scissors,
 } from "lucide-react";
 
 const icons: Record<string, typeof LayoutGrid> = {
@@ -22,6 +23,7 @@ const icons: Record<string, typeof LayoutGrid> = {
   integrations: Plug,
   mcp: Terminal,
   analytics: BarChart3,
+  highlights: Scissors,
 };
 
 function Icon({ name }: { name: string }) {
@@ -30,6 +32,14 @@ function Icon({ name }: { name: string }) {
 }
 
 export default function Layout() {
+  useEffect(() => {
+    fetch("/api/session-cache/clear", { method: "POST" }).then((res) => {
+      if (!res.ok) console.warn("Failed to clear session cache", res.status);
+    }).catch((err: unknown) => {
+      console.warn("Failed to clear session cache", err);
+    });
+  }, []);
+
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -41,6 +51,7 @@ export default function Layout() {
         <NavLink to="/" end className="sidebar-link"><Icon name="library" /> Library</NavLink>
         <NavLink to="/episode" className="sidebar-link"><Icon name="episode" /> New episode</NavLink>
         <NavLink to="/content" className="sidebar-link"><Icon name="content" /> Content</NavLink>
+        <NavLink to="/highlights" className="sidebar-link"><Icon name="highlights" /> Highlights</NavLink>
         <NavLink to="/thumbnails" className="sidebar-link"><Icon name="thumbnail" /> Thumbnails</NavLink>
 
         <div className="sidebar-section">Workspace</div>
